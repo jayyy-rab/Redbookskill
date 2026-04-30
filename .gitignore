@@ -1,0 +1,23 @@
+# Secrets / local env
+.env.local
+.env.portable
+*.pem
+config/accounts.json
+
+# Browser profiles / cookies checked in by mistake previously — never commit
+scripts/edge_profile/
+scripts/cookies.json
+scripts/cookies_for_api.json
+scripts/qr_data.json
+
+# Runtime / caches
+tmp/
+tmp_tea_publish/
+*.log
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# IDE (optional local overrides)
+.cursor/

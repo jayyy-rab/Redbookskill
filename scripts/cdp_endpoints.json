@@ -1,0 +1,90 @@
+﻿{
+    "value":  [
+                  {
+                      "description":  "",
+                      "devtoolsFrontendUrl":  "https://aka.ms/docs-landing-page/serve_rev/@3a0d90fcf938b1203f4e1336ee027f2e0cb539f6/inspector.html?ws=localhost:9222/devtools/page/FC4C15AB6D515EE4BE138F8855B17476",
+                      "faviconUrl":  "http://127.0.0.1:18789/favicon.svg",
+                      "id":  "FC4C15AB6D515EE4BE138F8855B17476",
+                      "title":  "OpenClaw Control",
+                      "type":  "page",
+                      "url":  "http://127.0.0.1:18789/chat?session=agent%3Amain%3Amain",
+                      "webSocketDebuggerUrl":  "ws://localhost:9222/devtools/page/FC4C15AB6D515EE4BE138F8855B17476"
+                  },
+                  {
+                      "description":  "",
+                      "devtoolsFrontendUrl":  "https://aka.ms/docs-landing-page/serve_rev/@3a0d90fcf938b1203f4e1336ee027f2e0cb539f6/inspector.html?ws=localhost:9222/devtools/page/B5D6DA5C1E2224B077889612EAC3560F",
+                      "faviconUrl":  "https://cn.bing.com/sa/simg/favicon-trans-bg-blue-mg.ico",
+                      "id":  "B5D6DA5C1E2224B077889612EAC3560F",
+                      "title":  "小红书 - 搜索",
+                      "type":  "page",
+                      "url":  "https://cn.bing.com/search?qs=HS\u0026pq=%e5%b0%8f%e7%ba%a2%e4%b9%a6\u0026sk=CSYN1\u0026sc=16-3\u0026pglt=425\u0026q=%E5%B0%8F%E7%BA%A2%E4%B9%A6\u0026cvid=4de3eff91587475aab2056b621d8a18f\u0026gs_lcrp=EgRlZGdlKgYIABAAGEAyBggAEAAYQDIGCAEQLhhAMgYIAhAAGEAyBggDEAAYQDIGCAQQABhAMgYIBRAAGEAyBggGEEUYPTIGCAcQRRg9MgYICBBFGDzSAQgxNjYzajBqN6gCCLACAQ\u0026FORM=ANNTA1\u0026adppc=EDGESSB\u0026PC=HCTS",
+                      "webSocketDebuggerUrl":  "ws://localhost:9222/devtools/page/B5D6DA5C1E2224B077889612EAC3560F"
+                  },
+                  {
+                      "description":  "",
+                      "devtoolsFrontendUrl":  "https://aka.ms/docs-landing-page/serve_rev/@3a0d90fcf938b1203f4e1336ee027f2e0cb539f6/inspector.html?ws=localhost:9222/devtools/page/E7489C899EC282EE717BAAA29CE6D876",
+                      "faviconUrl":  "https://assets.msn.cn/statics/icons/favicon_newtabpage.png",
+                      "id":  "E7489C899EC282EE717BAAA29CE6D876",
+                      "title":  "新建标签页",
+                      "type":  "other",
+                      "url":  "edge://newtab/",
+                      "webSocketDebuggerUrl":  "ws://localhost:9222/devtools/page/E7489C899EC282EE717BAAA29CE6D876"
+                  },
+                  {
+                      "description":  "",
+                      "devtoolsFrontendUrl":  "https://aka.ms/docs-landing-page/serve_rev/@3a0d90fcf938b1203f4e1336ee027f2e0cb539f6/inspector.html?ws=localhost:9222/devtools/page/13F15A57E3397D70607834BA1F1EBAE1",
+                      "faviconUrl":  "https://fe-video-qc.xhscdn.com/fe-platform/ed8fe781ce9e16c1bfac2cd962f0721edabe2e49.ico",
+                      "id":  "13F15A57E3397D70607834BA1F1EBAE1",
+                      "title":  "小红书 - 你的生活兴趣社区",
+                      "type":  "page",
+                      "url":  "https://www.xiaohongshu.com/explore",
+                      "webSocketDebuggerUrl":  "ws://localhost:9222/devtools/page/13F15A57E3397D70607834BA1F1EBAE1"
+                  },
+                  {
+                      "description":  "",
+                      "devtoolsFrontendUrl":  "https://aka.ms/docs-landing-page/serve_rev/@3a0d90fcf938b1203f4e1336ee027f2e0cb539f6/inspector.html?ws=localhost:9222/devtools/page/00662796F3FFAACFA6EEC7E07A2217B4",
+                      "id":  "00662796F3FFAACFA6EEC7E07A2217B4",
+                      "title":  "TabSearch",
+                      "type":  "other",
+                      "url":  "edge://tab-search.top-chrome/",
+                      "webSocketDebuggerUrl":  "ws://localhost:9222/devtools/page/00662796F3FFAACFA6EEC7E07A2217B4"
+                  },
+                  {
+                      "description":  "",
+                      "devtoolsFrontendUrl":  "https://aka.ms/docs-landing-page/serve_rev/@3a0d90fcf938b1203f4e1336ee027f2e0cb539f6/worker_app.html?ws=localhost:9222/devtools/page/396F92D34F56F486F47A4ACAE677B5FA",
+                      "id":  "396F92D34F56F486F47A4ACAE677B5FA",
+                      "title":  "Service Worker https://www.msn.cn/homepage/service-worker.js?bundles=latest\u0026amp;riverAgeMinutes=-1\u0026amp;enableStaticRouting=true\u0026amp;enableStaticNavRouting=true\u0026amp;enableStaticAdsRouting=true",
+                      "type":  "service_worker",
+                      "url":  "https://www.msn.cn/homepage/service-worker.js?bundles=latest\u0026riverAgeMinutes=-1\u0026enableStaticRouting=true\u0026enableStaticNavRouting=true\u0026enableStaticAdsRouting=true",
+                      "webSocketDebuggerUrl":  "ws://localhost:9222/devtools/page/396F92D34F56F486F47A4ACAE677B5FA"
+                  },
+                  {
+                      "description":  "",
+                      "devtoolsFrontendUrl":  "https://aka.ms/docs-landing-page/serve_rev/@3a0d90fcf938b1203f4e1336ee027f2e0cb539f6/worker_app.html?ws=localhost:9222/devtools/page/9CA933F8551DA1182AC39B066F5FE6B5",
+                      "id":  "9CA933F8551DA1182AC39B066F5FE6B5",
+                      "title":  "Service Worker chrome-extension://hofgfmmdolnmimplihglefekekfcfijf/BackgroundServiceWorker.js",
+                      "type":  "service_worker",
+                      "url":  "chrome-extension://hofgfmmdolnmimplihglefekekfcfijf/BackgroundServiceWorker.js",
+                      "webSocketDebuggerUrl":  "ws://localhost:9222/devtools/page/9CA933F8551DA1182AC39B066F5FE6B5"
+                  },
+                  {
+                      "description":  "",
+                      "devtoolsFrontendUrl":  "https://aka.ms/docs-landing-page/serve_rev/@3a0d90fcf938b1203f4e1336ee027f2e0cb539f6/worker_app.html?ws=localhost:9222/devtools/page/0D50D654A99C98B98B4C4A961F84262F",
+                      "id":  "0D50D654A99C98B98B4C4A961F84262F",
+                      "title":  "Service Worker chrome-extension://iikmkjmpaadaobahmlepeloendndfphd/background.js",
+                      "type":  "service_worker",
+                      "url":  "chrome-extension://iikmkjmpaadaobahmlepeloendndfphd/background.js",
+                      "webSocketDebuggerUrl":  "ws://localhost:9222/devtools/page/0D50D654A99C98B98B4C4A961F84262F"
+                  },
+                  {
+                      "description":  "",
+                      "devtoolsFrontendUrl":  "https://aka.ms/docs-landing-page/serve_rev/@3a0d90fcf938b1203f4e1336ee027f2e0cb539f6/inspector.html?ws=localhost:9222/devtools/page/20D8C74A781C60D387A0DFB9D7673A28",
+                      "id":  "20D8C74A781C60D387A0DFB9D7673A28",
+                      "title":  "",
+                      "type":  "worker",
+                      "url":  "",
+                      "webSocketDebuggerUrl":  "ws://localhost:9222/devtools/page/20D8C74A781C60D387A0DFB9D7673A28"
+                  }
+              ],
+    "Count":  9
+}

@@ -1,0 +1,14 @@
+{
+  "interval_seconds": 3600,
+  "groups": {
+    "A": {
+      "offset_seconds": 0
+    },
+    "B": {
+      "offset_seconds": 1800
+    }
+  },
+  "default": {
+    "offset_seconds": 0
+  }
+}
