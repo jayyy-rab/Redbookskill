@@ -1,0 +1,12 @@
+本仓库「客户交付 / 快照锁死」使用 Git 标签，不在此文件里写死 commit hash。
+
+使用方式（任选其一）
+
+1）仍在 Git 中开发时，回到本快照：
+   git fetch --tags
+   git checkout redbookskills-client-freeze-20260430
+
+2）给客户 zip：请对本标签执行打包（勿直接打包未打标签的工作副本），例如：
+   git archive --format=zip --output=redbookskills-client-freeze-20260430.zip redbookskills-client-freeze-20260430
+
+说明：脚本与 Skill 正文以该 tag 所指提交为准；日常开发继续在 master/main 上进行，新版本再打新标签即可。
