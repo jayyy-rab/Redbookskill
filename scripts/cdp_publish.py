@@ -623,7 +623,7 @@ class XiaohongshuPublisher:
             self.ws.close()
             self.ws = None
 
-    def _reconnect_cdp(self) -> bool:
+    def _reconnect_cdp(self, _retry_count: int = 0) -> bool:
         """CDP 断开后重新获取 target 并建立新 WebSocket 连接。成功返回 True。"""
         print("[cdp_publish] CDP 连接断开，尝试重新连接...")
         old_ws = self.ws
@@ -681,6 +681,10 @@ class XiaohongshuPublisher:
             return True
         except Exception as e:
             print(f"[cdp_publish] CDP 重连异常: {e}")
+            if _retry_count < 1 and "No browser tabs available" in str(e):
+                print("[cdp_publish] 2 秒后重试...")
+                time.sleep(2.0)
+                return self._reconnect_cdp(_retry_count=1)
             self.ws = None
             return False
 
