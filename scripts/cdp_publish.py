@@ -332,6 +332,7 @@ class XiaohongshuPublisher:
         timing_jitter: float = 0.25,
         account_name: str | None = None,
         preserve_upload_paths: bool = False,
+        context_key: str | None = None,
     ):
         self.host = host
         self.port = port
@@ -340,6 +341,7 @@ class XiaohongshuPublisher:
         self.timing_jitter = _normalize_timing_jitter(timing_jitter)
         self.account_name = (account_name or "default").strip() or "default"
         self.preserve_upload_paths = bool(preserve_upload_paths)
+        self.context_key = context_key
         self.command_timeout_seconds = CDP_COMMAND_TIMEOUT
         self.login_cache_ttl_hours = DEFAULT_LOGIN_CACHE_TTL_HOURS
         self.login_cache_ttl_seconds = self.login_cache_ttl_hours * 3600
@@ -509,7 +511,7 @@ class XiaohongshuPublisher:
                     if _is_local_host(self.host):
                         print(f"[cdp_publish] CDP connection failed ({e}), restarting Chrome...")
                         from chrome_launcher import ensure_chrome
-                        ensure_chrome(port=self.port)
+                        ensure_chrome(port=self.port, account=self.account_name)
                     else:
                         print(
                             f"[cdp_publish] CDP connection failed ({e}), retrying remote endpoint "
@@ -544,7 +546,8 @@ class XiaohongshuPublisher:
 
         if target_url_prefix:
             for t in pages:
-                if t.get("url", "").startswith(target_url_prefix):
+                url = t.get("url", "")
+                if target_url_prefix in url:
                     return t["webSocketDebuggerUrl"]
 
         if reuse_existing_tab and pages:
@@ -621,6 +624,67 @@ class XiaohongshuPublisher:
             self.ws.close()
             self.ws = None
 
+    def _reconnect_cdp(self) -> bool:
+        """CDP 断开后重新获取 target 并建立新 WebSocket 连接。成功返回 True。"""
+        print("[cdp_publish] CDP 连接断开，尝试重新连接...")
+        old_ws = self.ws
+        self.ws = None
+        if old_ws:
+            try:
+                old_ws.close()
+            except Exception:
+                pass
+        try:
+            import requests
+            # 1) 优先查找小红书发布页 tab
+            ws_url = self._find_or_create_tab(
+                target_url_prefix="creator.xiaohongshu.com/publish",
+                reuse_existing_tab=True,
+            )
+            # 2) 无发布页时找任意小红书 tab（排除 chrome://）
+            if not ws_url:
+                targets = self._get_targets()
+                pages = [
+                    t for t in targets
+                    if t.get("type") == "page" and t.get("webSocketDebuggerUrl")
+                ]
+                for t in pages:
+                    curl = str(t.get("url") or "")
+                    if "xiaohongshu.com" in curl.lower() and "chrome://" not in curl:
+                        ws_url = t["webSocketDebuggerUrl"]
+                        print(f"[cdp_publish] 使用小红书 tab: {curl[:60]}")
+                        break
+            # 3) 无任何小红书 tab，创建新发布页 tab
+            if not ws_url:
+                resp = requests.put(
+                    f"http://{self.host}:{self.port}/json/new?{XHS_CREATOR_URL}",
+                    timeout=5,
+                )
+                if resp.ok:
+                    ws_url = resp.json().get("webSocketDebuggerUrl", "")
+                    print(f"[cdp_publish] 创建发布页 tab")
+            if not ws_url:
+                print("[cdp_publish] 重连失败：无法找到或创建小红书发布页 tab")
+                return False
+
+            self.ws = ws_client.connect(ws_url)
+            print(f"[cdp_publish] CDP 重连成功")
+
+            # 4) 确认 URL 是小红书发布页，否则导航
+            try:
+                current_url = str(self._evaluate("window.location.href") or "")
+                if "/publish" not in current_url or "xiaohongshu.com" not in current_url:
+                    print(f"[cdp_publish] 重连后 URL 不是发布页: {current_url}，导航到发布页")
+                    self._navigate(XHS_CREATOR_URL)
+            except Exception:
+                print(f"[cdp_publish] 重连后无法读取 URL，导航到发布页")
+                self._navigate(XHS_CREATOR_URL)
+            return True
+        except Exception as e:
+            print(f"[cdp_publish] CDP 重连异常: {e}")
+            self.ws = None
+            return False
+
     # ------------------------------------------------------------------
     # CDP command helpers
     # ------------------------------------------------------------------
@@ -631,7 +695,10 @@ class XiaohongshuPublisher:
         params: dict | None = None,
         timeout_seconds: float | None = None,
     ) -> dict:
-        """Send a CDP command and return the result with a bounded wait."""
+        """Send a CDP command and return the result with a bounded wait。
+
+        如果 WebSocket 连接断开，自动重连一次后重试。
+        """
         if not self.ws:
             raise CDPError("Not connected. Call connect() first.")
 
@@ -641,7 +708,20 @@ class XiaohongshuPublisher:
         if params:
             msg["params"] = params
 
-        self.ws.send(json.dumps(msg))
+        try:
+            self.ws.send(json.dumps(msg))
+        except Exception as exc:
+            # 连接断开时尝试重连 + 重试一次
+            if self._reconnect_cdp():
+                print(f"[cdp_publish] 重连后重试 CDP 命令: {method}")
+                self._msg_id += 1
+                msg["id"] = self._msg_id
+                self.ws.send(json.dumps(msg))
+            else:
+                raise CDPError(
+                    f"CDP send failed for {method}: {exc}"
+                ) from exc
+
         timeout = float(timeout_seconds or self.command_timeout_seconds)
         deadline = time.monotonic() + max(0.1, timeout)
 
@@ -662,7 +742,15 @@ class XiaohongshuPublisher:
                     f"after {timeout:.1f}s."
                 ) from exc
             except Exception as exc:
-                raise CDPError(f"CDP receive failed while waiting for {method}: {exc}") from exc
+                # 连接断开时尝试重连 + 递归重试一次
+                if self._reconnect_cdp():
+                    print(f"[cdp_publish] 重连后递归重试 CDP 命令: {method}")
+                    return self._send(
+                        method, params=params, timeout_seconds=timeout_seconds
+                    )
+                raise CDPError(
+                    f"CDP receive failed while waiting for {method}: {exc}"
+                ) from exc
 
             try:
                 data = json.loads(raw)
@@ -3327,7 +3415,7 @@ class XiaohongshuPublisher:
     def _query_node_id(self, selector: str) -> int:
         """Return the first DOM node id matching selector, or 0 when absent."""
         self._send("DOM.enable")
-        doc = self._send("DOM.getDocument")
+        doc = self._send("DOM.getDocument", {"depth": 1})
         root_id = doc["root"]["nodeId"]
         result = self._send("DOM.querySelector", {
             "nodeId": root_id,
@@ -3343,7 +3431,11 @@ class XiaohongshuPublisher:
                     {json.dumps(SELECTORS["image_preview_items"])},
                     ".img-preview-area [class*='preview']",
                     ".draggable-item",
-                    "[class*='img-preview'] .pr"
+                    "[class*='img-preview'] .pr",
+                    "[class*='cropper']",
+                    "[class*='upload-preview'] img",
+                    "[class*='preview-container'] img",
+                    "[class*='image-item']",
                 ];
                 let maxCount = 0;
                 for (const selector of selectors) {{
@@ -3371,6 +3463,31 @@ class XiaohongshuPublisher:
             if current_count >= expected_count:
                 return
             self._sleep(0.5, minimum_seconds=0.15)
+
+        # 超时：检查页面状态确认上传是否实际成功
+        print("[cdp_publish] Preview count timeout, checking page state...")
+        fallback = self._evaluate("""
+            (function() {
+                var fis = document.querySelectorAll('input[type="file"]');
+                var allHidden = true;
+                var hasImageAccept = false;
+                for (var i = 0; i < fis.length; i++) {
+                    var st = window.getComputedStyle(fis[i]);
+                    if (st.display !== 'none') allHidden = false;
+                    if ((fis[i].accept || '').indexOf('jpg') >= 0 || (fis[i].accept || '').indexOf('image') >= 0)
+                        hasImageAccept = true;
+                }
+                // 文件输入已隐藏 + 有图片类输入 = 页面已进入编辑状态
+                if (allHidden && hasImageAccept) return 'accepted';
+                // 编辑器或添加商品按钮出现也表示上传成功
+                var t = document.body.innerText || '';
+                if (t.indexOf('添加商品') >= 0) return 'editor_ready';
+                return '';
+            })()
+        """)
+        if fallback:
+            print(f"[cdp_publish] Upload confirmed via page state ({fallback}), continuing.")
+            return
 
         raise CDPError(
             f"Timed out waiting for image upload preview {expected_count}. "
@@ -3595,7 +3712,45 @@ class XiaohongshuPublisher:
 
     def _click_image_text_tab(self):
         """Click the '上传图文' tab to switch to image+text publish mode."""
-        self._click_tab(SELECTORS["image_text_tab"], SELECTORS["image_text_tab_text"])
+        # 检查页面是否已有发布内容（已上传图片/已挂载商品）
+        _existing = self._evaluate("""
+            (function() {
+                var t = document.body.innerText || '';
+                if (t.indexOf('商品ID') >= 0) return 'has_product_card';
+                var imgs = document.querySelectorAll('img');
+                for (var i = 0; i < imgs.length; i++) {
+                    if (imgs[i].width > 80 && imgs[i].height > 80) return 'has_uploaded_images';
+                }
+                return '';
+            })()
+        """)
+        if _existing:
+            # 有遗留内容（之前运行的产物），导航到干净 URL 重新加载
+            print(f"[cdp_publish] 页面有遗留内容 ({_existing})，导航到干净发布页")
+            clean_url = "https://creator.xiaohongshu.com/publish/publish?source=official"
+            self._navigate(clean_url)
+            self._sleep(3, minimum_seconds=1.5)
+            # 导航后重新尝试点击 tab
+            try:
+                self._click_tab(SELECTORS["image_text_tab"], SELECTORS["image_text_tab_text"])
+            except CDPError:
+                image_url = clean_url + "&from=tab_switch"
+                print(f"[cdp_publish] 导航到图文模式 URL")
+                self._navigate(image_url)
+                self._sleep(2, minimum_seconds=1.0)
+            return
+
+        try:
+            self._click_tab(SELECTORS["image_text_tab"], SELECTORS["image_text_tab_text"])
+        except CDPError:
+            current_url = str(self._evaluate("window.location.href") or "")
+            if "from=tab_switch" not in current_url:
+                image_url = "https://creator.xiaohongshu.com/publish/publish?source=official&from=tab_switch"
+                print(f"[cdp_publish] 导航到图文模式 URL")
+                self._navigate(image_url)
+                self._sleep(2, minimum_seconds=1.0)
+            else:
+                raise
 
     def _click_video_tab(self):
         """Click the '上传视频' tab to switch to video publish mode."""
@@ -3639,6 +3794,15 @@ class XiaohongshuPublisher:
                 "files": [file_path],
             })
             print(f"[cdp_publish] Image {index}/{len(prepared_paths)} submitted: {file_path}")
+            # 触发 change/input 事件确保 React 检测到文件上传
+            self._evaluate("""(function() {
+                var inp = document.querySelector('input[type=\"file\"]');
+                if (inp) {
+                    inp.dispatchEvent(new Event('change', {bubbles: true}));
+                    inp.dispatchEvent(new Event('input', {bubbles: true}));
+                }
+                return true;
+            })()""")
             self._wait_for_uploaded_images(index)
             self._sleep(0.9, minimum_seconds=0.25)
 
@@ -3956,16 +4120,18 @@ class XiaohongshuPublisher:
         })
 
     def _click_mouse(self, x: float, y: float):
-        """Perform a real left-click via CDP at the given coordinates."""
-        for event_type in ("mousePressed", "mouseReleased"):
-            self._send("Input.dispatchMouseEvent", {
-                "type": event_type,
-                "x": float(x),
-                "y": float(y),
-                "button": "left",
-                "clickCount": 1,
-            })
-            time.sleep(0.05)
+        """Perform a real left-click via CDP at the given coordinates.
+
+        Sends mouseMoved to position the cursor, then mousePressed and
+        mouseReleased with clickCount=1 for a full click gesture that
+        React SPAs recognize as a trusted user click.
+        """
+        x, y = float(x), float(y)
+        self._send("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y})
+        time.sleep(0.02)
+        self._send("Input.dispatchMouseEvent", {"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1})
+        time.sleep(0.05)
+        self._send("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1})
 
     def _click_element_by_cdp(self, description: str, js_get_rect: str):
         """Click an element using CDP Input.dispatchMouseEvent for reliable clicks.
@@ -3990,16 +4156,7 @@ class XiaohongshuPublisher:
         cy = rect["y"] + rect["height"] / 2
         print(f"[cdp_publish] Clicking {description} at ({cx:.0f}, {cy:.0f})...")
 
-        # Dispatch a full mouse click sequence via CDP
-        for event_type in ("mousePressed", "mouseReleased"):
-            self._send("Input.dispatchMouseEvent", {
-                "type": event_type,
-                "x": cx,
-                "y": cy,
-                "button": "left",
-                "clickCount": 1,
-            })
-            time.sleep(0.05)
+        self._click_mouse(cx, cy)
 
     def _click_publish(self, scheduled: bool = False):
         """Click the publish button using CDP mouse events."""
@@ -4038,6 +4195,668 @@ class XiaohongshuPublisher:
         """)
 
         return note_link
+
+    def click_add_product(self, strict: bool = False) -> bool:
+        """查找并点击"添加商品"按钮，等待商品弹窗打开。
+
+        查找策略：先精确匹配 button 文本"添加商品"，再尝试文本包含匹配。
+        点击成功后轮询检测弹窗（最多等 10 秒），弹窗出现返回 True。
+
+        Args:
+            strict: True 时失败抛 CDPError，False 时只返回 False。
+
+        Returns:
+            bool: 弹窗是否成功打开。
+        """
+        print("[cdp_publish] Clicking add-product button...")
+        try:
+            current_url = self._evaluate("window.location.href") or ""
+        except Exception:
+            current_url = ""
+        print(f"[cdp_publish] Current URL: {current_url[:100]}")
+
+        # === 多策略查找按钮 ===
+        def _find_btn() -> dict | None:
+            """在页面中查找添加商品按钮，返回 {x, y} 或 None。"""
+            js = r"""(function() {
+                function normAddProductText(s) {
+                    return String(s || '').replace(/\s+/g, ' ').trim().replace(/^\++\s*/, '').trim();
+                }
+                var candidates = [];
+                // 策略1: button 文本匹配（兼容 [+] 添加商品）
+                var btns = document.querySelectorAll('button');
+                for (var i = 0; i < btns.length; i++) {
+                    var t = (btns[i].innerText || '').trim();
+                    var st = window.getComputedStyle(btns[i]);
+                    if (normAddProductText(t) === '添加商品' && st.display !== 'none' && st.visibility !== 'hidden') {
+                        candidates.push({el: btns[i], text: t, score: 3});
+                    }
+                }
+                // 策略2: .multi-good-select-empty-btn
+                var extras = document.querySelectorAll('.multi-good-select-empty-btn');
+                for (var j = 0; j < extras.length; j++) {
+                    var t2 = (extras[j].innerText || '').trim();
+                    var st2 = window.getComputedStyle(extras[j]);
+                    if (t2.indexOf('添加商品') >= 0 && st2.display !== 'none' && st2.visibility !== 'hidden') {
+                        candidates.push({el: extras[j], text: t2, score: 2});
+                    }
+                }
+                // 策略3: 任意可见元素文本包含"添加商品"
+                if (candidates.length === 0) {
+                    var all = document.querySelectorAll('span,div,[class*="add"],[class*="btn"]');
+                    for (var k = 0; k < all.length; k++) {
+                        var t3 = (all[k].innerText || '').trim();
+                        var st3 = window.getComputedStyle(all[k]);
+                        if (normAddProductText(t3) === '添加商品' && st3.display !== 'none' && st3.visibility !== 'hidden') {
+                            candidates.push({el: all[k], text: t3, score: 1});
+                        }
+                    }
+                }
+                if (candidates.length === 0) return null;
+                candidates.sort(function(a,b){return b.score - a.score;});
+                var best = candidates[0].el;
+                var bestText = candidates[0].text;
+                best.scrollIntoView({block: 'center'});
+                var r = best.getBoundingClientRect();
+                return {x: r.x + r.width/2, y: r.y + r.height/2, w: r.width, h: r.height, text: bestText};
+            })()"""
+            raw = self._evaluate(js)
+            if isinstance(raw, dict) and raw.get("x", 0) > 0:
+                return raw
+            return None
+
+        btn = _find_btn()
+        if not btn:
+            print("[cdp_publish] 添加商品按钮未找到")
+            if strict:
+                raise CDPError("添加商品按钮未找到")
+            return False
+
+        x, y = float(btn["x"]), float(btn["y"])
+        btn_text = str(btn.get("text", ""))
+        print(f"[cdp_publish] 添加商品按钮: text='{btn_text}' pos=({x:.0f},{y:.0f})")
+
+        # === CDP 鼠标点击 ===
+        self._click_mouse(x, y)
+
+        # === 轮询检测弹窗（最多 10 秒）===
+        print("[cdp_publish] 等待商品弹窗...")
+        dialog_indicators = [
+            r"""document.body.innerText.indexOf('选择商品') >= 0""",
+            r"""document.querySelectorAll('[class*="modal"][class*="goods"],[class*="dialog"][class*="goods"],[class*="goods-select"]').length > 0""",
+            r"""document.querySelectorAll('.goods-list-normal,[class*="goods-list"]').length > 0""",
+            r"""document.querySelectorAll('input[type="checkbox"]').length > 1""",
+        ]
+        for i in range(20):
+            self._sleep(0.5, minimum_seconds=0.3)
+            for idx, indicator_js in enumerate(dialog_indicators):
+                try:
+                    val = self._evaluate(indicator_js)
+                    if val:
+                        print(f"[cdp_publish] 弹窗已打开 (指示器[{chr(65+idx)}])")
+                        return True
+                except Exception:
+                    continue
+            try:
+                body_len = self._evaluate("(document.body.innerText||'').length")
+                if body_len and body_len > 450:
+                    print(f"[cdp_publish] 弹窗可能已打开 (文本长度={body_len})")
+                    return True
+            except Exception:
+                pass
+
+        # === 超时失败 ===
+        print("[cdp_publish] 添加商品弹窗未在 10 秒内打开")
+        try:
+            img = self._send("Page.captureScreenshot", {"format": "png", "fromSurface": True})
+            if img and "data" in img:
+                import base64
+                path = "tmp/click_add_product_fail.png"
+                with open(path, "wb") as f:
+                    f.write(base64.b64decode(img["data"]))
+                print(f"[cdp_publish] 失败截图: {path}")
+        except Exception as e:
+            print(f"[cdp_publish] 截图失败: {e}")
+
+        if strict:
+            raise CDPError("添加商品弹窗未打开")
+        return False
+
+    # ------------------------------------------------------------------
+    # Product selection workflow
+    # ------------------------------------------------------------------
+
+    def select_product_with_match(self, product_name="", product_id="", strict=False):
+        """打开商品弹窗 → 匹配商品 → CDP鼠标点击复选框 → 验证 → CDP鼠标点击保存 → 验证弹窗关闭"""
+        target_name = product_name
+        target_id = product_id
+
+        # === Phase 1: JS 匹配商品，获取复选框坐标（不执行 .click()） ===
+        result = self._evaluate(
+            f"""
+            (async () => {{
+                function norm(s) {{
+                    return String(s || '').replace(/\\s+/g, '').trim().toLowerCase();
+                }}
+                function isVisible(el) {{
+                    if (!el) return false;
+                    var r = el.getBoundingClientRect();
+                    var st = window.getComputedStyle(el);
+                    return r.width > 0 && r.height > 0 && st.visibility !== 'hidden' && st.display !== 'none';
+                }}
+                function pickText(root, selectors) {{
+                    for (var i = 0; i < selectors.length; i++) {{
+                        var n = root.querySelector(selectors[i]);
+                        if (n && isVisible(n)) {{
+                            var t = String(n.innerText || n.textContent || '').trim();
+                            if (t) return t;
+                        }}
+                    }}
+                    return '';
+                }}
+                function extractId(el) {{
+                    var attrs = ['data-id', 'data-spu-id', 'data-sku-id', 'data-goods-id', 'data-product-id'];
+                    for (var i = 0; i < attrs.length; i++) {{
+                        var v = el.getAttribute(attrs[i]);
+                        if (v && String(v).trim()) return String(v).trim();
+                    }}
+                    if (el.dataset) {{
+                        var keys = ['id', 'spuId', 'skuId', 'goodsId', 'productId'];
+                        for (var j = 0; j < keys.length; j++) {{
+                            var dv = el.dataset[keys[j]];
+                            if (dv && String(dv).trim()) return String(dv).trim();
+                        }}
+                    }}
+                    var txt = String(el.innerText || el.textContent || '');
+                    var m = txt.match(/ID\\s*[:?]\\s*([0-9a-zA-Z_-]+)/i);
+                    if (m && m[1]) return String(m[1]).trim();
+                    return '';
+                }}
+                function firstPrice(text) {{
+                    var m = String(text || '').match(/¥\\s*\\d+(?:\\.\\d+)?|\\d+(?:\\.\\d+)?元/);
+                    return m ? m[0] : '';
+                }}
+                var cardSelectors = [
+                    '.goods-item', '.product-item',
+                    '[class*="goods-item"]', '[class*="product-item"]',
+                    '[class*="goods"]', '[class*="product"]',
+                    'li', '.semi-table-row', '.goods-list-normal'
+                ];
+                const sleep = (ms) => new Promise(function(resolve) {{ setTimeout(resolve, ms); }});
+                for (var poll = 0; poll < 12; poll++) {{
+                    var testCards = [];
+                    for (var si = 0; si < cardSelectors.length; si++) {{
+                        var tn = Array.from(document.querySelectorAll(cardSelectors[si])).filter(isVisible);
+                        if (tn.length) {{ testCards = tn; break; }}
+                    }}
+                    var hasReal = false;
+                    for (var tc = 0; tc < testCards.length; tc++) {{
+                        var tt = String(testCards[tc].innerText || testCards[tc].textContent || '').trim();
+                        if (tt.length > 5 && tt.indexOf('加载') < 0 && tt.indexOf('选择我') < 0) {{ hasReal = true; break; }}
+                    }}
+                    if (hasReal) break;
+                    await sleep(1000);
+                }}
+                var cards = [];
+                for (var i = 0; i < cardSelectors.length; i++) {{
+                    var nodes = Array.from(document.querySelectorAll(cardSelectors[i])).filter(isVisible);
+                    if (nodes.length) {{ cards = nodes; break; }}
+                }}
+                var candidates = [];
+                var seenKey = {{}};
+                for (var c = 0; c < cards.length; c++) {{
+                    var card = cards[c];
+                    var text = String(card.innerText || card.textContent || '').trim();
+                    if (!text || text.length < 2) continue;
+                    var name = pickText(card, [
+                        '[class*="name"]', '[class*="title"]', '[class*="goods-name"]',
+                        '[class*="product-name"]', 'h3','h4'
+                    ]);
+                    if (!name) {{
+                        var lines = text.split(/\\n+/).map(function(x){{return x.trim();}}).filter(Boolean);
+                        name = lines.length ? lines[0] : '';
+                    }}
+                    var shop = pickText(card, ['[class*="shop"]','[class*="store"]','[class*="merchant"]']);
+                    var idv = extractId(card);
+                    var price = firstPrice(text);
+                    var key = norm(name) + '|' + idv + '|' + price;
+                    if (seenKey[key]) continue;
+                    seenKey[key] = true;
+                    candidates.push({{
+                        index: candidates.length, name: name || '', shop: shop || '',
+                        price: price || '', id: idv || '', text: text.slice(0, 200),
+                    }});
+                    if (candidates.length >= 30) break;
+                }}
+                var targetName = norm({json.dumps(target_name)});
+                var targetId = String({json.dumps(target_id)}).trim();
+                var chosen = null;
+                var rule = '';
+                if (targetId) {{
+                    for (var a = 0; a < candidates.length; a++) {{
+                        if (String(candidates[a].id || '').trim() === targetId) {{ chosen = candidates[a]; rule = 'product_id_exact'; break; }}
+                    }}
+                }}
+                if (!chosen && targetName) {{
+                    for (var b = 0; b < candidates.length; b++) {{
+                        if (norm(candidates[b].name) === targetName) {{ chosen = candidates[b]; rule = 'product_name_exact'; break; }}
+                    }}
+                }}
+                if (!chosen && targetName) {{
+                    for (var d = 0; d < candidates.length; d++) {{
+                        var cn = norm(candidates[d].name);
+                        if (cn && (cn.indexOf(targetName) >= 0 || targetName.indexOf(cn) >= 0)) {{ chosen = candidates[d]; rule = 'product_name_fuzzy_contains'; break; }}
+                    }}
+                }}
+                if (!chosen) {{
+                    return {{ ok: false, reason: 'no_match_candidate', target: {{ name: {json.dumps(target_name)}, id: {json.dumps(target_id)} }}, candidates: candidates }};
+                }}
+                var chosenNode = cards[chosen.index] || null;
+                if (!chosenNode) {{
+                    return {{ ok: false, reason: 'chosen_node_missing', target: {{ name: {json.dumps(target_name)}, id: {json.dumps(target_id)} }}, candidates: candidates, matched: chosen, rule: rule }};
+                }}
+                var checkbox = chosenNode.querySelector('input[type="checkbox"],input[type="radio"],.semi-checkbox,.d-checkbox');
+                var clickTarget = checkbox || chosenNode;
+                clickTarget.scrollIntoView({{block: 'center'}});
+                await sleep(400);
+                var rect = clickTarget.getBoundingClientRect();
+                var selectedCountBefore = (document.body.innerText.match(/已选择\\s*\\d+\\s*项/) || [''])[0];
+                return {{
+                    ok: true, phase: 'checkbox_ready',
+                    checkbox_found: !!checkbox,
+                    checkbox_rect: {{x: rect.x, y: rect.y, w: rect.width, h: rect.height}},
+                    selected_count_before: selectedCountBefore,
+                    candidates: candidates, matched: chosen, rule: rule,
+                }};
+            }})()
+            """
+        )
+        if not isinstance(result, dict):
+            result = {"ok": False, "reason": "invalid_result_type"}
+        _phase1_ok = bool(result.get("ok"))
+        _cands = result.get("candidates") or []
+        _matched = result.get("matched") or {}
+        _rule = str(result.get("rule") or "")
+
+        if not _phase1_ok:
+            print(f"[cdp_publish] 商品匹配失败: {result.get('reason', '未知')}")
+            if strict:
+                raise CDPError(f"商品匹配失败: {result.get('reason', '未知')}")
+            return result
+
+        # === Phase 2: CDP鼠标事件点击复选框 ===
+        _selected_before = str(result.get("selected_count_before") or "")
+        if "1项" in _selected_before:
+            print(f"[cdp_publish] 复选框已选中，跳过 CDP 点击")
+        else:
+            cr = result["checkbox_rect"]
+            cx, cy = cr["x"] + cr["w"] / 2, cr["y"] + cr["h"] / 2
+            print(f"[cdp_publish] CDP点击复选框 ({cx:.0f}, {cy:.0f})")
+            self._click_mouse(cx, cy)
+            self._sleep(0.5, minimum_seconds=0.3)
+
+        # === Phase 3: 验证复选框选中状态，查找保存按钮坐标 ===
+        verify = self._evaluate(
+            """
+            (function() {
+                var t = document.body.innerText || '';
+                var m = t.match(/已选择\\s*\\d+\\s*项/);
+                var after = m ? m[0] : '';
+                var checkedEl = document.querySelector('input[type="checkbox"]:checked, .semi-checkbox.checked, [class*="checkbox-checked"], [class*="semi-checkbox-checked"]');
+                var isChecked = !!checkedEl;
+                var btns = document.querySelectorAll('button,[role="button"],.semi-button,.d-button');
+                var saveBtn = null;
+                for (var i = 0; i < btns.length; i++) {
+                    var txt = (btns[i].innerText || '').trim();
+                    if (txt.indexOf('保存') >= 0) {
+                        var st = window.getComputedStyle(btns[i]);
+                        if (st.display !== 'none' && st.visibility !== 'hidden' && parseInt(st.width) > 10) {
+                            saveBtn = btns[i]; break;
+                        }
+                    }
+                }
+                if (!saveBtn) {
+                    return JSON.stringify({ok: false, selected_count_after: after, checkbox_checked: isChecked, save_found: false});
+                }
+                saveBtn.scrollIntoView({block: 'center'});
+                var sr = saveBtn.getBoundingClientRect();
+                return JSON.stringify({
+                    ok: true, selected_count_after: after, checkbox_checked: isChecked,
+                    save_found: true,
+                    save_rect: {x: sr.x, y: sr.y, w: sr.width, h: sr.height}
+                });
+            })()
+            """
+        )
+        if not isinstance(verify, str):
+            verify = '{"ok": false, "selected_count_after": "", "checkbox_checked": false, "save_found": false}'
+        verify = json.loads(verify)
+        _after = str(verify.get("selected_count_after") or "")
+        _checked = bool(verify.get("checkbox_checked"))
+        _save_found = bool(verify.get("save_found"))
+
+        # 如果复选框未选中且计数未变，返回失败
+        if not _checked and "1项" not in _after:
+            print(f"[cdp_publish] 复选框CDP点击失败: count='{_after}' checked={_checked}")
+            return {
+                "ok": False, "reason": "checkbox_cdp_click_failed",
+                "target": {"name": target_name, "id": target_id},
+                "candidates": _cands, "matched": _matched, "rule": _rule,
+                "checkbox_found": bool(result.get("checkbox_found")),
+                "checkbox_clicked": _checked,
+                "selected_count_before": str(result.get("selected_count_before") or ""),
+                "selected_count_after": _after,
+                "save_button_found": _save_found, "save_clicked": False,
+            }
+
+        _save_success = False
+
+        if not _save_found:
+            # 弹窗中找不到"保存"按钮 -> 检查商品是否已挂载（幂等情况）
+            _matched_name = str(_matched.get("name") or "")
+            already_mounted = self._evaluate(
+                f"""
+                (function() {{
+                    var section = document.querySelector(
+                        '[class*="publish-form"],[class*="creator-form"],' +
+                        '[class*="publish-container"],[class*="publish-content"]'
+                    );
+                    var text = section ? (section.innerText || '') : (document.body.innerText || '');
+                    if (!text) return false;
+                    var names = {json.dumps([_matched_name]) if _matched_name else '[]'};
+                    for (var i = 0; i < names.length; i++) {{
+                        if (names[i] && text.indexOf(names[i]) >= 0) return true;
+                    }}
+                    return false;
+                }})()
+                """
+            )
+            if already_mounted:
+                _save_success = True
+                _modal_closed = True
+                _has_product = True
+                print(f"[cdp_publish] 商品已挂载，无需重新保存")
+            else:
+                return {
+                    "ok": False, "reason": "save_button_not_found",
+                    "target": {"name": target_name, "id": target_id},
+                    "candidates": _cands, "matched": _matched, "rule": _rule,
+                    "checkbox_found": True, "checkbox_clicked": True,
+                    "selected_count_before": str(result.get("selected_count_before") or ""),
+                    "selected_count_after": _after,
+                    "save_button_found": False, "save_clicked": False,
+                }
+
+        # === Phase 4: CDP鼠标事件点击保存 + 分层 fallback ===
+        if _save_success:
+            print(f"[cdp_publish] 保存已无需执行（商品已挂载）")
+        else:
+            sr = verify["save_rect"]
+            sx, sy = sr["x"] + sr["w"] / 2, sr["y"] + sr["h"] / 2
+            # 点击前重新滚动并获取最新坐标（防止弹窗内部滚动导致坐标偏移）
+            save_btn_refresh = self._evaluate(
+            """
+            (function() {
+                var btns = document.querySelectorAll('button,[role="button"],.semi-button,.d-button');
+                for (var i = 0; i < btns.length; i++) {
+                    var txt = (btns[i].innerText || '').trim();
+                    if (txt.indexOf('保存') >= 0) {
+                        var st = window.getComputedStyle(btns[i]);
+                        if (st.display !== 'none' && st.visibility !== 'hidden' && parseInt(st.width) > 10) {
+                            btns[i].scrollIntoView({block: 'center'});
+                            var r = btns[i].getBoundingClientRect();
+                            var cx = r.x + r.width/2, cy = r.y + r.height/2;
+                            var hit = document.elementFromPoint(cx, cy);
+                            var hitTag = hit ? (hit.tagName || '') : '';
+                            var hitText = hit ? (hit.innerText || '').trim().slice(0, 30) : '';
+                            var isHit = hit === btns[i] || btns[i].contains(hit);
+                            return JSON.stringify({
+                                x: cx, y: cy, w: r.width, h: r.height,
+                                elementFromPoint: {tag: hitTag, text: hitText, isTarget: isHit}
+                            });
+                        }
+                    }
+                }
+                return '{}';
+            })()
+            """
+        )
+            if isinstance(save_btn_refresh, str):
+                try:
+                    save_btn_refresh = json.loads(save_btn_refresh)
+                except Exception:
+                    save_btn_refresh = None
+
+            _save_success = False
+
+            if save_btn_refresh and save_btn_refresh.get("x", 0) > 0:
+                sx, sy = float(save_btn_refresh["x"]), float(save_btn_refresh["y"])
+                element_info = save_btn_refresh.get("elementFromPoint", {})
+                hit_target = bool(element_info.get("isTarget"))
+                print(f"[cdp_publish] 保存按钮坐标 ({sx:.0f}, {sy:.0f}) "
+                      f"elementFromPoint: tag={element_info.get('tag','?')} isTarget={hit_target}")
+
+                # 第一层: 键盘 Enter（最有效，优先尝试）
+                print(f"[cdp_publish] 保存: 尝试键盘 Enter")
+                self._send("Input.dispatchKeyEvent", {"type": "keyDown", "key": "Enter", "code": "Enter"})
+                self._send("Input.dispatchKeyEvent", {"type": "keyUp", "key": "Enter", "code": "Enter"})
+                self._sleep(0.5, minimum_seconds=0.3)
+                for _ in range(6):
+                    still_open = self._evaluate(
+                        "!!document.querySelector('.d-modal-mask,[class*=\"goods-select\"],[class*=\"multi-goods\"]')"
+                    )
+                    if not still_open:
+                        _save_success = True
+                        break
+                    self._sleep(0.5, minimum_seconds=0.3)
+
+                # 第二层: CDP 鼠标点击回退
+                if not _save_success:
+                    print(f"[cdp_publish] 保存: Enter 未关闭弹窗，尝试 CDP 鼠标点击")
+                    self._click_mouse(sx, sy)
+                    self._sleep(0.5, minimum_seconds=0.3)
+                    # 轮询弹窗是否关闭
+                    for _ in range(6):
+                        still_open = self._evaluate(
+                            "!!document.querySelector('.d-modal-mask,[class*=\"goods-select\"],[class*=\"multi-goods\"]')"
+                        )
+                        if not still_open:
+                            _save_success = True
+                            break
+                        self._sleep(0.5, minimum_seconds=0.3)
+
+                # 第三层: JS .click() 回退
+                if not _save_success:
+                    js_ok = self._evaluate(
+                        r"""(function() {
+                            var btns = document.querySelectorAll('button,[role="button"],.semi-button,.d-button');
+                            for (var i = 0; i < btns.length; i++) {
+                                var txt = (btns[i].innerText || '').trim();
+                                if (txt.indexOf('保存') >= 0) {
+                                    var st = window.getComputedStyle(btns[i]);
+                                    if (st.display !== 'none' && st.visibility !== 'hidden') {
+                                        btns[i].scrollIntoView({block: 'center'});
+                                        btns[i].click();
+                                        return true;
+                                    }
+                                }
+                            }
+                            return false;
+                        })()"""
+                    )
+                    if js_ok:
+                        self._sleep(0.5, minimum_seconds=0.3)
+                        for _ in range(6):
+                            still_open = self._evaluate(
+                                "!!document.querySelector('.d-modal-mask,[class*=\"goods-select\"],[class*=\"multi-goods\"]')"
+                            )
+                            if not still_open:
+                                _save_success = True
+                                break
+                            self._sleep(0.5, minimum_seconds=0.3)
+        if _save_success:
+            print(f"[cdp_publish] 保存成功，弹窗已关闭")
+            self._sleep(0.5, minimum_seconds=0.3)
+        else:
+            print(f"[cdp_publish] 保存失败，弹窗未关闭")
+            try:
+                img = self._send("Page.captureScreenshot", {"format": "png", "fromSurface": True})
+                if img and "data" in img:
+                    import base64
+                    path = "tmp/save_btn_fail.png"
+                    with open(path, "wb") as f:
+                        f.write(base64.b64decode(img["data"]))
+                    print(f"[cdp_publish] 保存失败截图: {path}")
+            except Exception:
+                pass
+
+        # === Phase 5: 验证弹窗关闭 + 发布页商品区域 ===
+        _matched_name = str(_matched.get("name") or "")
+        _product_check_names = json.dumps([_matched_name] if _matched_name else [])
+        final = self._evaluate(
+            f"""
+            (function() {{
+                var t = document.body.innerText || '';
+                var selectedMatch = (t.match(/已选择\\s*\\d+\\s*项/) || [''])[0];
+                // 检查弹窗/覆盖层
+                var overlays = document.querySelectorAll(
+                    '[class*="dialog"],[class*="modal"],[class*="overlay"],'
+                    + '[class*="popup"],[class*="drawer"],[aria-modal="true"]'
+                );
+                var modalFound = false;
+                for (var i = 0; i < overlays.length; i++) {{
+                    var st = window.getComputedStyle(overlays[i]);
+                    var w = parseInt(st.width) || 0;
+                    var h = parseInt(st.height) || 0;
+                    if (st.display !== 'none' && st.visibility !== 'hidden' && w > 100 && h > 50) {{
+                        modalFound = true; break;
+                    }}
+                }}
+                // 检查保存按钮是否还在
+                var saveStillVisible = false;
+                var btns = document.querySelectorAll('button,[role="button"]');
+                for (var i = 0; i < btns.length; i++) {{
+                    var txt = (btns[i].innerText || '').trim();
+                    if (txt === '保存') {{
+                        var st = window.getComputedStyle(btns[i]);
+                        if (st.display !== 'none' && st.visibility !== 'hidden') {{
+                            saveStillVisible = true; break;
+                        }}
+                    }}
+                }}
+                // 只在发布页商品区域检查商品名（不在弹窗内）
+                var publishSection = document.querySelector(
+                    '[class*="publish-form"],[class*="creator-form"],'
+                    + '[class*="publish-container"],[class*="publish-content"]'
+                );
+                var sectionText = publishSection ? (publishSection.innerText || '') : '';
+                // 如果没找到指定区域，用 body 文本并排除弹窗区域
+                if (!sectionText) {{
+                    var modalEl = overlays.length > 0 ? overlays[0] : null;
+                    var bodyText = document.body.innerText || '';
+                    sectionText = bodyText;
+                    if (modalEl) {{
+                        var modalText = modalEl.innerText || '';
+                        if (modalText && bodyText.indexOf(modalText) >= 0 && bodyText.length - modalText.length < 200) {{
+                            sectionText = '';
+                        }}
+                    }}
+                }}
+                var productNames = {_product_check_names};
+                var foundProduct = '';
+                for (var i = 0; i < productNames.length; i++) {{
+                    if (sectionText.indexOf(productNames[i]) >= 0) {{
+                        foundProduct = productNames[i]; break;
+                    }}
+                }}
+                return JSON.stringify({{
+                    modal_closed: !modalFound,
+                    no_save_button_visible: !saveStillVisible,
+                    selected_count: selectedMatch,
+                    has_product_in_section: !!foundProduct,
+                    product_name_found: foundProduct,
+                }});
+            }})()
+            """
+        )
+        if not isinstance(final, str):
+            final = '{"modal_closed": false, "no_save_button_visible": false}'
+        final = json.loads(final)
+        _modal_closed = bool(final.get("modal_closed"))
+        _no_save = bool(final.get("no_save_button_visible"))
+        _final_selected = str(final.get("selected_count") or "")
+        _has_product = bool(final.get("has_product_in_section"))
+
+        # 成功条件：弹窗关闭 + 保存按钮消失 + 发布页区域有商品名
+        product_ok = _modal_closed and _no_save and _has_product
+        # mounted 独立于 product_ok：只要商品卡片出现在发布页就算挂载
+        mounted = _has_product
+        result = {
+            "ok": product_ok,
+            "target": {"name": target_name, "id": target_id},
+            "candidates": _cands, "matched": _matched, "rule": _rule,
+            "mounted": mounted,
+            "checkbox_found": bool(result.get("checkbox_found")),
+            "checkbox_clicked": _checked,
+            "selected_count_before": str(result.get("selected_count_before") or ""),
+            "selected_count_after": _final_selected or _after,
+            "save_button_found": _save_found,
+            "save_clicked": _no_save,
+            "modal_closed_after_save": _modal_closed,
+            "product_attached_on_publish_page": _has_product,
+        }
+        _verify_fields = {k: result.get(k) for k in [
+            "checkbox_found", "checkbox_clicked",
+            "selected_count_before", "selected_count_after",
+            "save_button_found", "save_clicked",
+            "modal_closed_after_save", "product_attached_on_publish_page",
+        ]}
+        print(f"[cdp_publish] 商品选择验证: {json.dumps(_verify_fields, ensure_ascii=False)}")
+        if not product_ok and strict:
+            raise CDPError(f"商品选择失败: {_verify_fields}")
+        return result
+
+    def attach_product_link(self, product_link: str):
+        """兼容包装：处理 --product-link 参数，防止 AttributeError。
+
+        【警告】此函数是 API 兼容占位，当前不会实际挂载任何商品。
+        商品选择请使用 click_add_product + select_product_with_match（--product-name / --product-id）。
+        --product-link 功能尚未接入，此处仅做日志记录。
+        """
+        print(f"[cdp_publish] attach_product_link called (product_link={product_link})")
+        print("[cdp_publish] ⚠️  兼容占位：attach_product_link 不会实际挂载商品。")
+        print("[cdp_publish] ⚠️  如需商品选择，请使用 --product-name / --product-id。")
+        print("[cdp_publish] Note: --product-link is logged but not yet implemented.")
+
+    def select_product_once(self, strict=False):
+        """兼容旧调用：选择第一个可见商品（用于 legacy 模式）"""
+        result = self._evaluate(
+            """
+            (function() {
+                var cards = document.querySelectorAll('[class*="goods"],[class*="product"],[class*="item"]');
+                for (var i = 0; i < cards.length; i++) {
+                    var cb = cards[i].querySelector('input[type="checkbox"],.semi-checkbox,[class*="checkbox"]');
+                    if (cb) {
+                        var r = cb.getBoundingClientRect();
+                        return JSON.stringify({found: true, x: r.x + r.width/2, y: r.y + r.height/2});
+                    }
+                }
+                return JSON.stringify({found: false});
+            })()
+            """
+        )
+        if isinstance(result, str):
+            try:
+                result = json.loads(result)
+            except json.JSONDecodeError:
+                result = None
+        if result and result.get("found"):
+            self._click_mouse(result["x"], result["y"])
+            self._sleep(0.5, minimum_seconds=0.3)
+            print("[cdp_publish] select_product_once: 已选择第一个商品")
+            return True
+        print("[cdp_publish] select_product_once: 未找到商品")
+        return False
 
     # ------------------------------------------------------------------
     # Main publish workflow

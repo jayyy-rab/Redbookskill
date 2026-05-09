@@ -45,17 +45,12 @@ Exit codes:
 """
 
 import argparse
-import base64
 import json
 import os
 import random
 import re
 import sys
 import time
-import traceback
-from collections import deque
-from datetime import datetime
-from pathlib import Path
 
 # Ensure UTF-8 output on Windows consoles
 if sys.platform == "win32":
@@ -71,22 +66,18 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
-from chrome_launcher import ensure_chrome, is_port_open, restart_chrome
+from chrome_launcher import ensure_chrome, get_default_account_and_port, restart_chrome
 from cdp_publish import XiaohongshuPublisher, CDPError
+from core_config import resolve_runtime_target
+from core_logger import create_run_logger
+from env_local_loader import load_env_local
 from image_downloader import ImageDownloader
+from license_client import LicenseClient, LicenseError
+from local_license import LocalLicenseError, validate_local_license_file
 from run_lock import SingleInstanceError, single_instance
 
 
 MAX_TIMING_JITTER_RATIO = 0.7
-LOG_RING: deque[str] = deque(maxlen=300)
-_BUILTIN_PRINT = print
-
-
-def print(*args, **kwargs):
-    msg = " ".join(str(x) for x in args)
-    if msg:
-        LOG_RING.append(msg)
-    return _BUILTIN_PRINT(*args, **kwargs)
 
 
 def _normalize_timing_jitter(value: float) -> float:
@@ -189,82 +180,69 @@ def _verify_local_files_exist(
             sys.exit(2)
 
 
-def _normalize_nickname(text: str) -> str:
-    return re.sub(r"\s+", "", (text or "").strip().lower())
+def _read_client_version() -> str:
+    """Read version string from repository VERSION file."""
+    version_path = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "VERSION"))
+    try:
+        with open(version_path, encoding="utf-8") as f:
+            version = f.read().strip()
+        return version or "unknown"
+    except Exception:
+        return "unknown"
 
 
-def _detect_creator_nickname(publisher: XiaohongshuPublisher) -> str:
+def _extract_current_creator_nickname(
+    publisher: XiaohongshuPublisher,
+) -> str:
+    """Best-effort read current creator nickname from page DOM."""
     result = publisher._evaluate(
         """
         (() => {
-          const pick = (sel) => {
-            const nodes = [...document.querySelectorAll(sel)];
-            for (const n of nodes) {
-              const t = (n.innerText || n.textContent || '').trim();
-              if (t && t.length >= 2 && t.length <= 32) return t;
-            }
-            return '';
-          };
-          const candidates = [
-            '.user-info [class*="name"]',
-            '.user-info',
-            '.creator-header [class*="name"]',
-            '[class*="user"] [class*="name"]',
-            '[class*="nickname"]',
-            'header [class*="name"]',
-          ];
-          for (const sel of candidates) {
-            const v = pick(sel);
-            if (v) return v;
-          }
-          return '';
+            const nodes = Array.from(
+                document.querySelectorAll(
+                    ".user-info, .creator-header, [class*='user'], [class*='account'], [class*='avatar'], [class*='name'], [class*='nickname']"
+                )
+            );
+            const text = nodes
+                .map((node) => String(node && (node.innerText || node.textContent || "") || "").trim())
+                .find((v) => v.length > 0);
+            return text || "";
         })()
         """
     )
-    return (result or "").strip() if isinstance(result, str) else ""
+    return result.strip() if isinstance(result, str) else ""
 
 
-def _write_failure_snapshot(
-    publisher: XiaohongshuPublisher | None,
-    *,
-    stage: str,
-    error_text: str,
-) -> None:
-    try:
-        snap_dir = Path(SCRIPT_DIR).parent / "tmp" / "failure_snapshots"
-        snap_dir.mkdir(parents=True, exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        base = f"publish_{stage}_{ts}"
+def _assert_expected_nickname(
+    publisher: XiaohongshuPublisher,
+    expected_nickname: str,
+):
+    """Validate current creator account nickname with one retry."""
+    expected = (expected_nickname or "").strip()
+    if not expected:
+        return
 
-        png_path = snap_dir / f"{base}.png"
-        log_path = snap_dir / f"{base}.log"
+    observed = ""
+    for attempt in range(1, 3):
+        observed = _extract_current_creator_nickname(publisher)
+        if observed == expected:
+            print(f"[pipeline] Nickname verified: {observed}")
+            return
 
-        if publisher and publisher.ws:
-            try:
-                publisher._send("Page.enable")
-                shot = publisher._send(
-                    "Page.captureScreenshot",
-                    {"format": "png", "captureBeyondViewport": True},
-                )
-                data = shot.get("data", "")
-                if isinstance(data, str) and data:
-                    png_path.write_bytes(base64.b64decode(data))
-            except Exception:
-                pass
+        print(
+            "[pipeline] Nickname check mismatch: "
+            f"expected='{expected}' observed='{observed or '-'}' "
+            f"(attempt {attempt}/2)"
+        )
+        if attempt < 2:
+            print("[pipeline] Retrying nickname check after reloading creator home...")
+            publisher._navigate("https://creator.xiaohongshu.com/new/home")
+            publisher._sleep(1.2, minimum_seconds=0.6)
 
-        tail = list(LOG_RING)[-30:]
-        body = []
-        body.append(f"stage={stage}")
-        body.append(f"error={error_text}")
-        body.append("")
-        body.append("recent_logs_tail_30:")
-        body.extend(tail)
-        log_path.write_text("\n".join(body) + "\n", encoding="utf-8")
-        print(f"[pipeline] Failure snapshot saved: {log_path}")
-        if png_path.is_file():
-            print(f"[pipeline] Failure screenshot saved: {png_path}")
-    except Exception:
-        pass
+    raise CDPError(
+        "Nickname verification failed. "
+        f"expected='{expected}', observed='{observed or 'unknown'}'."
+    )
 
 
 def _select_topics(
@@ -294,7 +272,7 @@ def _select_topics(
         newline_literal = json.dumps("\n")
         hash_literal = json.dumps("#")
         space_literal = json.dumps(" ")
-        eval_payload = f"""
+        result = publisher._evaluate(f"""
             (async function() {{
                 var editor = document.querySelector(
                     'div.tiptap.ProseMirror, div.ProseMirror[contenteditable="true"]'
@@ -377,25 +355,7 @@ def _select_topics(
                 insertTextAtCaret({space_literal});
                 return {{ ok: true, selected: true }};
             }})()
-        """
-
-        result: dict | None = None
-        last_eval_err: str | None = None
-        for ev_try in range(1, 4):
-            try:
-                result = publisher._evaluate(eval_payload)
-                last_eval_err = None
-                break
-            except Exception as exc:
-                last_eval_err = str(exc)
-                print(
-                    f"[pipeline] Warning: topic #{index + 1} CDP evaluate try {ev_try}/3 failed: {exc}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                time.sleep(_jitter_seconds(1.1, timing_jitter, minimum_seconds=0.6))
-        if last_eval_err is not None and result is None:
-            result = {"ok": False, "reason": f"cdp_gave_up:{last_eval_err}"}
+        """)
 
         if not (isinstance(result, dict) and result.get("ok")):
             failed_tags.append(tag)
@@ -415,6 +375,9 @@ def _select_topics(
 
 
 def main():
+    # Load portable/local env defaults before parsing CLI args.
+    load_env_local(SCRIPT_DIR)
+
     parser = argparse.ArgumentParser(
         description="Xiaohongshu publish pipeline - unified entry point"
     )
@@ -467,6 +430,27 @@ def main():
         action="store_true",
         default=False,
         help="Preview mode: fill content only and never click publish button",
+    )
+    parser.add_argument(
+        "--product-link",
+        default=(os.environ.get("XHS_PRODUCT_LINK", "").strip() or None),
+        help="Product link to attach right before clicking publish",
+    )
+    parser.add_argument(
+        "--product-name",
+        default=(os.environ.get("XHS_PRODUCT_NAME", "").strip() or None),
+        help="Target product name for strict add-product matching",
+    )
+    parser.add_argument(
+        "--product-id",
+        default=(os.environ.get("XHS_PRODUCT_ID", "").strip() or None),
+        help="Target product id for strict add-product matching",
+    )
+    parser.add_argument(
+        "--click-add-product",
+        action="store_true",
+        default=(os.environ.get("XHS_CLICK_ADD_PRODUCT", "").strip().lower() in {"1", "true", "yes", "on"}),
+        help="Click add-product button once before publish (best-effort).",
     )
 
     # Headless mode
@@ -530,9 +514,23 @@ def main():
         help="Account name to publish to (default: default account)",
     )
     parser.add_argument(
+        "--context-key",
+        default=(os.environ.get("XHS_CONTEXT_KEY", "").strip() or None),
+        help="Optional BrowserContext key for isolated multi-login in one Chrome process.",
+    )
+    parser.add_argument(
+        "--restart-browser-for-account",
+        action="store_true",
+        default=False,
+        help=(
+            "Force restart local Chrome for the selected account before publish. "
+            "Useful for shared local CDP ports in bulk mode."
+        ),
+    )
+    parser.add_argument(
         "--expected-nickname",
         default=None,
-        help="Strong guard: expected Xiaohongshu nickname; mismatch aborts publish.",
+        help="Optional expected creator nickname for account consistency check.",
     )
 
     # CDP port
@@ -548,40 +546,193 @@ def main():
         help="CDP remote debugging port (default: 9222)",
     )
     parser.add_argument(
-        "--restart-browser-for-account",
-        action="store_true",
-        default=False,
-        help=(
-            "Local CDP only: kill Chrome on this port and relaunch with the "
-            "profile for --account. Use this for multi-account runs when the "
-            "port may already be held by another profile (avoids wrong login)."
-        ),
+        "--license-server",
+        default=os.environ.get("XHS_LICENSE_SERVER", "").strip(),
+        help="License server base URL (or env XHS_LICENSE_SERVER).",
     )
     parser.add_argument(
-        "--disconnect-cdp",
-        action="store_true",
-        help=(
-            "Close DevTools WebSocket after publishing. "
-            "Default keeps the creator page open for review."
+        "--license-key",
+        default=os.environ.get("XHS_LICENSE_KEY", "").strip(),
+        help="License key (or env XHS_LICENSE_KEY).",
+    )
+    parser.add_argument(
+        "--license-product",
+        default=os.environ.get("XHS_LICENSE_PRODUCT", "redbookskills-monthly"),
+        help="License product code (default: redbookskills-monthly).",
+    )
+    parser.add_argument(
+        "--license-cache-path",
+        default=os.environ.get("XHS_LICENSE_CACHE_PATH", "").strip() or None,
+        help="Optional local license cache file path.",
+    )
+    parser.add_argument(
+        "--license-renew-before-hours",
+        type=float,
+        default=float(os.environ.get("XHS_LICENSE_RENEW_BEFORE_HOURS", "24")),
+        help="Renew license when remaining validity is below this threshold.",
+    )
+    parser.add_argument(
+        "--license-grace-hours",
+        type=float,
+        default=float(os.environ.get("XHS_LICENSE_GRACE_HOURS", "24")),
+        help="Allow temporary grace usage when renewal fails but cache is recent.",
+    )
+    parser.add_argument(
+        "--license-timeout-seconds",
+        type=float,
+        default=float(os.environ.get("XHS_LICENSE_TIMEOUT_SECONDS", "8")),
+        help="License server request timeout in seconds.",
+    )
+    parser.add_argument(
+        "--license-mode",
+        default=os.environ.get("XHS_LICENSE_MODE", "local").strip().lower(),
+        choices=["online", "local"],
+        help="License mode: local (default) or online.",
+    )
+    parser.add_argument(
+        "--local-license-file",
+        default=os.environ.get(
+            "XHS_LOCAL_LICENSE_FILE",
+            os.path.abspath(os.path.join(SCRIPT_DIR, "..", "config", "license.key")),
         ),
+        help="Local license JSON file path for --license-mode local.",
     )
 
+    port_explicit = "--port" in sys.argv
+    account_explicit = "--account" in sys.argv
     args = parser.parse_args()
     host = args.host
     port = args.port
     headless = args.headless
     account = args.account
+    account, port, runtime_meta = resolve_runtime_target(
+        host=host,
+        port=port,
+        account=account,
+        port_explicit=port_explicit,
+        account_explicit=account_explicit,
+    )
+    if _is_local_host(host):
+        account, port = get_default_account_and_port(
+            account=account if account_explicit else None,
+            port=port if port_explicit else None,
+        )
+    context_key = (args.context_key or "").strip() or None
     cache_account_name = _resolve_account_name(account)
     reuse_existing_tab = args.reuse_existing_tab
     timing_jitter = _normalize_timing_jitter(args.timing_jitter)
     local_mode = _is_local_host(host)
     post_time = args.post_time
+    logger = create_run_logger(
+        "publish_pipeline",
+        host=host,
+        port=int(port),
+        account=cache_account_name,
+        context_key=(context_key or ""),
+        mode=("local" if local_mode else "remote"),
+    )
+    logger.info(
+        "pipeline_start",
+        data={
+            "preview": bool(args.preview),
+            "headless": bool(headless),
+            "port_explicit": bool(port_explicit),
+            "account_explicit": bool(account_explicit),
+            "runtime_meta": runtime_meta,
+        },
+    )
+
+    if local_mode and not port_explicit:
+        try:
+            from account_manager import get_account_port
+            resolved_port = int(get_account_port(cache_account_name, fallback=port))
+            if resolved_port != int(port):
+                print(
+                    f"[pipeline] Auto port by account '{cache_account_name}': "
+                    f"{port} -> {resolved_port}"
+                )
+            port = resolved_port
+        except Exception:
+            pass
+    if args.product_link:
+        print(f"[pipeline] Product link enabled: {args.product_link}")
 
     if timing_jitter != args.timing_jitter:
         print(
             "[pipeline] Warning: --timing-jitter out of range. "
             f"Clamped to {timing_jitter:.2f}."
         )
+    run_mode = "dry_run" if bool(args.preview) else "real_run"
+
+    def emit_product_select_evidence(
+        *,
+        status: str,
+        reason: str = "",
+        rule: str = "",
+        ok: bool | None = None,
+        mounted: bool | None = None,
+        matched: dict | None = None,
+        candidates: list | None = None,
+    ) -> None:
+        payload = {
+            "status": status,
+            "reason": reason,
+            "rule": rule,
+            "ok": bool(ok) if ok is not None else None,
+            "mounted": bool(mounted) if mounted is not None else None,
+            "target": {
+                "product_name": (args.product_name or "").strip(),
+                "product_id": (args.product_id or "").strip(),
+            },
+            "matched": matched or {},
+            "candidates_count": len(candidates or []),
+            "run_mode": run_mode,
+            "ts": int(time.time() * 1000),
+        }
+        print("PRODUCT_SELECT_EVIDENCE_JSON:" + json.dumps(payload, ensure_ascii=False))
+
+    # --- License check ---
+    print(f"[pipeline] License: validating ({args.license_mode})...")
+    if args.license_mode == "local":
+        try:
+            local_result = validate_local_license_file(
+                license_file_path=args.local_license_file,
+                expected_license_key=args.license_key,
+            )
+            print(
+                "[pipeline] License OK "
+                f"(mode=local, expires_at={local_result.expires_at.isoformat()})"
+            )
+        except LocalLicenseError as e:
+            print(f"Error: local license validation failed: {e}", file=sys.stderr)
+            sys.exit(2)
+    else:
+        if not args.license_server:
+            print("Error: missing license server. Set --license-server or XHS_LICENSE_SERVER.", file=sys.stderr)
+            sys.exit(2)
+        if not args.license_key:
+            print("Error: missing license key. Set --license-key or XHS_LICENSE_KEY.", file=sys.stderr)
+            sys.exit(2)
+
+        try:
+            license_client = LicenseClient(
+                server_url=args.license_server,
+                license_key=args.license_key,
+                product=args.license_product,
+                cache_path=args.license_cache_path,
+                renew_before_hours=args.license_renew_before_hours,
+                grace_hours=args.license_grace_hours,
+                timeout_seconds=args.license_timeout_seconds,
+                client_version=_read_client_version(),
+            )
+            license_result = license_client.ensure_valid()
+            print(
+                "[pipeline] License OK "
+                f"(mode=online, source={license_result.source}, expires_at={license_result.expires_at.isoformat()})"
+            )
+        except LicenseError as e:
+            print(f"Error: online license validation failed: {e}", file=sys.stderr)
+            sys.exit(2)
 
     # --- Resolve title ---
     if args.title_file:
@@ -615,29 +766,23 @@ def main():
     # --- Step 1: Ensure Chrome is running ---
     mode_label = "headless" if headless else "headed"
     account_label = cache_account_name
-    if local_mode and args.restart_browser_for_account:
-        print(
-            f"[pipeline] Step 1: Restarting Chrome for account profile "
-            f"({mode_label}, account: {account_label}, host: {host}, port: {port})..."
-        )
-    else:
-        print(
-            f"[pipeline] Step 1: Ensuring Chrome is running "
-            f"({mode_label}, account: {account_label}, host: {host}, port: {port})..."
-        )
+    print(
+        f"[pipeline] Step 1: Ensuring Chrome is running "
+        f"({mode_label}, account: {account_label}, host: {host}, port: {port})..."
+    )
+    if context_key:
+        print(f"[pipeline] BrowserContext mode: context_key={context_key}")
     print(f"[pipeline] Timing jitter ratio: {timing_jitter:.2f}")
     if reuse_existing_tab:
         print("[pipeline] Tab selection mode: prefer reusing existing tab.")
     if local_mode:
         if args.restart_browser_for_account:
+            print(
+                "[pipeline] Step 1.0: Restarting Chrome for account consistency "
+                f"(account: {account_label}, port: {port})..."
+            )
             restart_chrome(port=port, headless=headless, account=account)
-            if not is_port_open(port):
-                print(
-                    "Error: Chrome did not become ready on the CDP port after restart.",
-                    file=sys.stderr,
-                )
-                sys.exit(2)
-        elif not ensure_chrome(port=port, headless=headless, account=account):
+        if not ensure_chrome(port=port, headless=headless, account=account):
             print("Error: Failed to start Chrome.", file=sys.stderr)
             sys.exit(2)
     else:
@@ -645,6 +790,11 @@ def main():
             f"[pipeline] Remote CDP mode enabled: {host}:{port}. "
             "Skipping local Chrome launch/restart."
         )
+        if args.restart_browser_for_account:
+            print(
+                "[pipeline] Warning: --restart-browser-for-account is ignored "
+                "in remote CDP mode."
+            )
 
     # --- Step 2: Connect and check login ---
     print("[pipeline] Step 2: Checking login status...")
@@ -653,14 +803,14 @@ def main():
         port=port,
         timing_jitter=timing_jitter,
         account_name=cache_account_name,
+        context_key=context_key,
         preserve_upload_paths=args.preserve_upload_paths,
     )
     try:
         publisher.connect(reuse_existing_tab=reuse_existing_tab)
         logged_in = publisher.check_login()
         if not logged_in:
-            if args.disconnect_cdp:
-                publisher.disconnect()
+            publisher.disconnect()
             if headless:
                 if local_mode:
                     # Auto-fallback: restart Chrome in headed mode for QR login
@@ -677,25 +827,9 @@ def main():
                     publisher.open_login_page()
             print("NOT_LOGGED_IN")
             sys.exit(1)
-
-        if args.expected_nickname and args.expected_nickname.strip():
-            expected = args.expected_nickname.strip()
-            detected = _detect_creator_nickname(publisher)
-            print(
-                f"[pipeline] Account guard: expected nickname={expected!r}, detected={detected!r}"
-            )
-            n_expected = _normalize_nickname(expected)
-            n_detected = _normalize_nickname(detected)
-            if not n_detected or (n_expected not in n_detected and n_detected not in n_expected):
-                err = (
-                    "Account nickname mismatch: "
-                    f"expected={expected!r}, detected={detected!r}"
-                )
-                _write_failure_snapshot(publisher, stage="nickname_mismatch", error_text=err)
-                print(f"Error: {err}", file=sys.stderr)
-                sys.exit(2)
+        if args.expected_nickname:
+            _assert_expected_nickname(publisher, args.expected_nickname)
     except CDPError as e:
-        _write_failure_snapshot(publisher, stage="login_check", error_text=str(e))
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(2)
 
@@ -753,7 +887,6 @@ def main():
         _select_topics(publisher, topic_tags, timing_jitter=timing_jitter)
         print("FILL_STATUS: READY_TO_PUBLISH")
     except CDPError as e:
-        _write_failure_snapshot(publisher, stage="form_fill", error_text=str(e))
         print(f"Error during form fill: {e}", file=sys.stderr)
         if downloader:
             downloader.cleanup()
@@ -763,29 +896,125 @@ def main():
     should_publish = not args.preview
     if args.auto_publish:
         print("[pipeline] --auto-publish is now default and can be omitted.")
+
+    # Step 5.0: product attach verification (runs in preview too; no publish click).
+    if args.click_add_product or args.product_name or args.product_id:
+        print("[pipeline] Step 5.0: Add-product verification...")
+        try:
+            clicked = publisher.click_add_product(strict=False)
+            if not clicked:
+                print("PRODUCT_SELECT_STATUS: MANUAL_REVIEW")
+                print("[pipeline] Product target: add-product dialog not opened.")
+                emit_product_select_evidence(
+                    status="manual_review",
+                    reason="add_product_dialog_not_opened",
+                    ok=False,
+                )
+                sys.exit(4)
+
+            if args.product_name or args.product_id:
+                select_result = publisher.select_product_with_match(
+                    product_name=args.product_name,
+                    product_id=args.product_id,
+                    strict=False,
+                )
+                rule = str(select_result.get("rule") or "")
+                mounted = bool(select_result.get("mounted"))
+                matched = select_result.get("matched") or {}
+                cands = select_result.get("candidates") or []
+                print(f"[pipeline] Product target: name={args.product_name or '-'} id={args.product_id or '-'}")
+                print(f"[pipeline] Product candidates ({len(cands)}): {json.dumps(cands, ensure_ascii=False)}")
+                print(f"[pipeline] Product matched: {json.dumps(matched, ensure_ascii=False)}")
+                print(f"[pipeline] Product match rule: {rule or '-'}")
+                print(f"[pipeline] Product mounted: {mounted}")
+                if not bool(select_result.get("ok")):
+                    print("PRODUCT_SELECT_STATUS: MANUAL_REVIEW")
+                    emit_product_select_evidence(
+                        status="manual_review",
+                        reason=str(select_result.get("reason") or "select_product_with_match_not_ok"),
+                        rule=rule,
+                        ok=bool(select_result.get("ok")),
+                        mounted=mounted,
+                        matched=matched,
+                        candidates=cands,
+                    )
+                    sys.exit(4)
+                if rule not in {"product_id_exact", "product_name_exact"}:
+                    if mounted:
+                        # 商品已挂载，fuzzy 匹配可确认，不阻塞客户流程
+                        print("[pipeline] Product fuzzy-matched but mounted, treating as VERIFIED")
+                    else:
+                        print("PRODUCT_SELECT_STATUS: MANUAL_REVIEW")
+                        emit_product_select_evidence(
+                            status="manual_review",
+                            reason="product_match_rule_not_exact",
+                            rule=rule,
+                            ok=bool(select_result.get("ok")),
+                            mounted=mounted,
+                            matched=matched,
+                            candidates=cands,
+                        )
+                        sys.exit(4)
+                print("PRODUCT_SELECT_STATUS: VERIFIED")
+                emit_product_select_evidence(
+                    status="verified",
+                    reason="",
+                    rule=rule,
+                    ok=bool(select_result.get("ok")),
+                    mounted=mounted,
+                    matched=matched,
+                    candidates=cands,
+                )
+            else:
+                print("[pipeline] Step 5.0.1: Selecting one product (legacy mode)...")
+                legacy_ok = bool(publisher.select_product_once(strict=False))
+                print("PRODUCT_SELECT_STATUS: LEGACY_SELECTED")
+                emit_product_select_evidence(
+                    status="legacy_selected" if legacy_ok else "manual_review",
+                    reason="" if legacy_ok else "legacy_select_product_failed",
+                    ok=legacy_ok,
+                )
+        except CDPError as e:
+            print(f"Error during product selection: {e}", file=sys.stderr)
+            emit_product_select_evidence(
+                status="manual_review",
+                reason=f"cdp_error:{e}",
+                ok=False,
+            )
+            sys.exit(4)
+
     if args.preview:
         print("[pipeline] Preview mode is on, skipping publish click.")
 
     if should_publish:
         print("[pipeline] Step 5: Clicking publish button...")
         try:
+            if args.product_link:
+                print("[pipeline] Step 5.1: Attaching product link...")
+                publisher.attach_product_link(args.product_link)
             note_link = publisher._click_publish(post_time != None)
             print("PUBLISH_STATUS: PUBLISHED")
             if note_link:
                 print(f"[pipeline] Note published at: {note_link}")
         except CDPError as e:
-            _write_failure_snapshot(publisher, stage="click_publish", error_text=str(e))
             print(f"Error clicking publish: {e}", file=sys.stderr)
             if downloader:
                 downloader.cleanup()
             sys.exit(2)
 
     # --- Cleanup ---
-    if args.disconnect_cdp:
-        publisher.disconnect()
+    publisher.disconnect()
     if downloader:
         downloader.cleanup()
 
+    logger.info(
+        "pipeline_done",
+        data={
+            "preview": bool(args.preview),
+            "published": bool(should_publish),
+            "media_mode": ("video" if is_video_mode else "image"),
+        },
+    )
     print("[pipeline] Done.")
 
 
