@@ -162,8 +162,7 @@ MAX_TIMING_JITTER_RATIO = 0.7
 CDP_COMMAND_TIMEOUT = 15.0
 # Runtime.evaluate with awaitPromise can run multi-second page scripts (e.g. topic tag typing).
 RUNTIME_EVALUATE_TIMEOUT_SECONDS = float(
-    # Picset and XHS SPA async evaluate chains can burst past 180s on busy tabs.
-    os.environ.get("REDBOOK_CDP_EVAL_TIMEOUT", "").strip() or "300"
+    os.environ.get("REDBOOK_CDP_EVAL_TIMEOUT", "").strip() or "30"
 )
 DEFAULT_LOGIN_CACHE_TTL_HOURS = 12.0
 LOGIN_CACHE_FILE = os.path.abspath(
@@ -736,20 +735,16 @@ class XiaohongshuPublisher:
 
             try:
                 raw = self.ws.recv(timeout=max(0.1, remaining))
-            except TimeoutError as exc:
-                raise CDPError(
-                    f"Timed out waiting for CDP response to {method} "
-                    f"after {timeout:.1f}s."
-                ) from exc
-            except Exception as exc:
-                # 连接断开时尝试重连 + 递归重试一次
+            except (TimeoutError, Exception) as exc:
+                # 超时或连接断开时尝试重连 + 递归重试一次
                 if self._reconnect_cdp():
                     print(f"[cdp_publish] 重连后递归重试 CDP 命令: {method}")
                     return self._send(
                         method, params=params, timeout_seconds=timeout_seconds
                     )
                 raise CDPError(
-                    f"CDP receive failed while waiting for {method}: {exc}"
+                    f"CDP receive failed while waiting for {method}: "
+                    f"{type(exc).__name__}: {exc}"
                 ) from exc
 
             try:
@@ -3423,10 +3418,17 @@ class XiaohongshuPublisher:
         })
         return int(result.get("nodeId", 0) or 0)
 
-    def _count_uploaded_images(self) -> int:
-        """Estimate how many uploaded image previews are visible."""
-        count = self._evaluate(f"""
+    def _count_uploaded_images(self, expected_count: int = 1) -> int:
+        """Multi-evidence estimation of uploaded image count.
+
+        Uses multiple signals to detect whether images uploaded successfully,
+        since XHS page DOM changes frequently and no single selector is reliable.
+        """
+        result = self._evaluate(f"""
             (() => {{
+                const expected = {expected_count};
+
+                // Evidence 1: Direct image preview elements (legacy selectors)
                 const selectors = [
                     {json.dumps(SELECTORS["image_preview_items"])},
                     ".img-preview-area [class*='preview']",
@@ -3437,23 +3439,58 @@ class XiaohongshuPublisher:
                     "[class*='preview-container'] img",
                     "[class*='image-item']",
                 ];
-                let maxCount = 0;
-                for (const selector of selectors) {{
-                    try {{
-                        maxCount = Math.max(maxCount, document.querySelectorAll(selector).length);
-                    }} catch (error) {{}}
+                for (const sel of selectors) {{
+                    try {{ const n = document.querySelectorAll(sel).length; if (n > 0) return n; }} catch(e) {{}}
                 }}
-                return maxCount;
+
+                // Evidence 2: Any img elements inside publish area
+                const area = document.querySelector(
+                    '[class*="publish-form"],[class*="creator-form"],.publish-page,.main-content'
+                );
+                if (area) {{
+                    const imgs = area.querySelectorAll('img');
+                    if (imgs.length > 0) return imgs.length;
+                }}
+
+                // Evidence 3: File inputs hidden + add-product button = upload confirmed
+                const fileInputs = document.querySelectorAll('input[type="file"]');
+                if (fileInputs.length > 0) {{
+                    const allHidden = Array.from(fileInputs).every(function(f) {{
+                        const s = window.getComputedStyle(f);
+                        return s.display === 'none';
+                    }});
+                    if (allHidden) {{
+                        const btns = document.querySelectorAll(
+                            'button,.multi-good-select-empty-btn,[class*="good"],[class*="add"]'
+                        );
+                        for (var i = 0; i < btns.length; i++) {{
+                            const t = (btns[i].innerText || '').trim();
+                            if (t.indexOf('添加商品') >= 0) return Math.max(expected, 1);
+                        }}
+                        const dels = document.querySelectorAll(
+                            '[class*="delete"],[class*="remove"],[class*="icon-close"],[class*="del-btn"]'
+                        );
+                        if (dels.length > 0) return Math.max(expected, dels.length);
+                    }}
+                }}
+
+                // Evidence 4: No file inputs but page in editor state
+                const bodyText = document.body.innerText || '';
+                if (fileInputs.length === 0 && bodyText.indexOf('添加商品') >= 0) {{
+                    return Math.max(expected, 1);
+                }}
+
+                return 0;
             }})()
         """)
-        return int(count or 0)
+        return int(result or 0)
 
     def _wait_for_uploaded_images(self, expected_count: int, timeout_seconds: float = 60.0):
-        """Wait until image preview count reaches the expected value."""
+        """Wait until image upload is confirmed via multi-evidence detection."""
         deadline = time.time() + max(5.0, float(timeout_seconds))
         last_count = -1
         while time.time() < deadline:
-            current_count = self._count_uploaded_images()
+            current_count = self._count_uploaded_images(expected_count)
             if current_count != last_count:
                 print(
                     "[cdp_publish] Waiting for uploaded image previews: "
@@ -3464,22 +3501,64 @@ class XiaohongshuPublisher:
                 return
             self._sleep(0.5, minimum_seconds=0.15)
 
-        # 超时：检查页面状态确认上传是否实际成功
-        print("[cdp_publish] Preview count timeout, checking page state...")
+        # Timeout — output diagnostics before fallback
+        print("[cdp_publish] Preview count timeout, collecting diagnostic evidence...")
+        diag = self._evaluate("""(function() {
+            var info = {};
+            var imgs = document.querySelectorAll('img');
+            info.imgCandidates = [];
+            for (var i = 0; i < Math.min(imgs.length, 15); i++) {
+                var r = imgs[i].getBoundingClientRect();
+                info.imgCandidates.push({src:(imgs[i].src||'').slice(-30), w:r.width, h:r.height, v:r.width>0});
+            }
+            var fis = document.querySelectorAll('input[type="file"]');
+            info.fileInputs = [];
+            for (var i = 0; i < fis.length; i++) {
+                var s = window.getComputedStyle(fis[i]);
+                info.fileInputs.push({d:s.display, a:(fis[i].accept||'').slice(0,20)});
+            }
+            var btns = document.querySelectorAll('button,.multi-good-select-empty-btn');
+            info.buttons = [];
+            for (var i = 0; i < btns.length; i++) {
+                var t = (btns[i].innerText||'').trim();
+                if (t) info.buttons.push({tag:btns[i].tagName, t:t.slice(0,30)});
+            }
+            return JSON.stringify(info);
+        })()""")
+        if diag:
+            print(f"[cdp_publish] Diagnostic: {str(diag)[:800]}")
+
+        ss = self._send("Page.captureScreenshot", {"format": "png", "fromSurface": True})
+        if ss and "data" in ss:
+            dump_dir = os.path.join(os.path.dirname(__file__) or ".", "tmp", "upload_diag")
+            os.makedirs(dump_dir, exist_ok=True)
+            path = os.path.join(dump_dir, f"timeout_{int(time.time())}.png")
+            with open(path, "wb") as f:
+                f.write(base64.b64decode(ss["data"]))
+            print(f"[cdp_publish] Screenshot saved: {path}")
+
+        dom = self._evaluate("document.documentElement.outerHTML.slice(0, 10000)")
+        if dom:
+            dump_dir = os.path.join(os.path.dirname(__file__) or ".", "tmp", "upload_diag")
+            os.makedirs(dump_dir, exist_ok=True)
+            path = os.path.join(dump_dir, f"timeout_{int(time.time())}.html")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(str(dom))
+            print(f"[cdp_publish] DOM dump saved: {path}")
+
+        # Fallback: check page state
+        print("[cdp_publish] Checking page state fallback...")
         fallback = self._evaluate("""
             (function() {
                 var fis = document.querySelectorAll('input[type="file"]');
-                var allHidden = true;
-                var hasImageAccept = false;
+                var allHidden = true; var hasImageAccept = false;
                 for (var i = 0; i < fis.length; i++) {
                     var st = window.getComputedStyle(fis[i]);
                     if (st.display !== 'none') allHidden = false;
                     if ((fis[i].accept || '').indexOf('jpg') >= 0 || (fis[i].accept || '').indexOf('image') >= 0)
                         hasImageAccept = true;
                 }
-                // 文件输入已隐藏 + 有图片类输入 = 页面已进入编辑状态
                 if (allHidden && hasImageAccept) return 'accepted';
-                // 编辑器或添加商品按钮出现也表示上传成功
                 var t = document.body.innerText || '';
                 if (t.indexOf('添加商品') >= 0) return 'editor_ready';
                 return '';
@@ -3491,7 +3570,7 @@ class XiaohongshuPublisher:
 
         raise CDPError(
             f"Timed out waiting for image upload preview {expected_count}. "
-            "The creator page structure may have changed."
+            "Diagnostic evidence saved to tmp/upload_diag/."
         )
 
     def _find_content_editor_selector(self) -> str | None:
