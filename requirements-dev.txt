@@ -1,0 +1,10 @@
+# Development and diagnostics dependencies
+# Install with: pip install -r requirements-dev.txt
+
+-r requirements.txt
+
+pytest>=8.0.0
+playwright>=1.45.0
+Pillow>=10.0.0
+opencv-python>=4.8.0
+pywin32>=306; platform_system == "Windows"

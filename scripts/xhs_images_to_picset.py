@@ -1,4 +1,4 @@
-"""
+﻿"""
 Download Xiaohongshu note images to a dated Desktop folder, then upload them to Picset
 「参考设计图」slot (same browser CDP session).
 
@@ -27,6 +27,8 @@ import os
 import sys
 import time
 import traceback
+
+from workflow_core import emit_step_result, StepResult
 
 if sys.platform == "win32":
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
@@ -66,7 +68,7 @@ from picset_automation import (  # noqa: E402
     _wait_for_login_if_needed,
 )
 
-DEFAULT_PICSET_CN = "https://picsetai.cn/"
+DEFAULT_PICSET_URL = "https://picsetai.com/zh-CN"
 
 
 def _debug_log(hypothesis_id: str, location: str, message: str, data: dict) -> None:
@@ -124,7 +126,13 @@ def _extract_cover_urls_from_search_stdout(raw_output: str, limit: int) -> list[
     if marker not in raw_output:
         return []
     try:
-        payload = json.loads(raw_output.split(marker, 1)[1])
+        tail = raw_output.split(marker, 1)[1].lstrip()
+        # stdout may be concatenated with stderr warnings; parse the first JSON object only.
+        decoder = json.JSONDecoder()
+        brace = tail.find("{")
+        if brace < 0:
+            return []
+        payload, _ = decoder.raw_decode(tail[brace:])
     except Exception:
         return []
 
@@ -136,7 +144,9 @@ def _extract_cover_urls_from_search_stdout(raw_output: str, limit: int) -> list[
             for key in ("urlDefault", "urlPre"):
                 val = cover.get(key)
                 if isinstance(val, str) and val.startswith("http"):
-                    urls.append(val)
+                    # XHS CDN often rejects plain HTTP with 403; prefer HTTPS.
+                    normalized = val.replace("http://", "https://", 1)
+                    urls.append(normalized)
                     break
         if len(urls) >= max(1, limit):
             break
@@ -326,7 +336,7 @@ def _picset_network_healthcheck(
             }}
           }};
           const online = navigator.onLine !== false;
-          const picset = await run('https://picsetai.cn/');
+          const picset = await run('https://picsetai.com/zh-CN');
           const xhsCdn = await run('https://sns-webpic-qc.xhscdn.com/');
           return {{ online, picset, xhsCdn }};
         }})()
@@ -426,27 +436,68 @@ def _is_transient_cdp_promise_failure(exc: BaseException) -> bool:
     )
 
 
+def _is_transient_cdp_disconnect(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    cls = exc.__class__.__name__.lower()
+    return (
+        "connectionclosed" in cls
+        or "connectionabortederror" in cls
+        or "no close frame received or sent" in msg
+        or "websocket is already closed" in msg
+        or "cannot call send once a close message has been sent" in msg
+        or "not connected. call connect() first" in msg
+        or "connection aborted" in msg
+        or "failed to establish a new connection" in msg
+        or "winerror 10053" in msg
+    )
+
+
+def _prompt_looks_corrupted(prompt_text: str) -> bool:
+    """Best-effort detector for terminal-encoding-corrupted prompts."""
+    s = (prompt_text or "").strip()
+    if not s:
+        return False
+    if "\ufffd" in s:
+        return True
+    # Typical corruption from non-UTF8 CLI on Windows: many '?' replacing CJK.
+    q_count = s.count("?")
+    if q_count >= 3 and (q_count / max(1, len(s))) >= 0.35:
+        return True
+    return False
+
+
 def _retry_on_cdp_promise_collected(
     fn,
     *,
     label: str,
     attempts: int = 5,
     delay_seconds: float = 2.0,
+    on_retry=None,
 ):
-    """Retry flaky CDP evaluate calls when Chrome reports 'Promise was collected'."""
+    """Retry flaky CDP evaluate calls when Chrome reports transient DevTools issues."""
     last_exc: BaseException | None = None
     for i in range(1, max(1, attempts) + 1):
         try:
             return fn()
-        except (CDPError, RuntimeError) as exc:
+        except Exception as exc:
             last_exc = exc
-            if not _is_transient_cdp_promise_failure(exc) or i >= attempts:
+            transient = _is_transient_cdp_promise_failure(exc) or _is_transient_cdp_disconnect(exc)
+            if not transient or i >= attempts:
                 raise
             print(
                 f"[xhs2picset] CDP transient ({label}) retry {i}/{attempts}: {exc}",
                 file=sys.stderr,
                 flush=True,
             )
+            if callable(on_retry):
+                try:
+                    on_retry(i, exc)
+                except Exception as recover_exc:
+                    print(
+                        f"[xhs2picset] retry recover failed ({label}): {recover_exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
             time.sleep(max(0.3, delay_seconds))
     if last_exc is not None:
         raise last_exc
@@ -464,10 +515,11 @@ def run_search_covers(
     publish_time: str,
     note_type: str,
     reuse_existing_tab: bool = True,
+    search_retries: int = 3,
 ) -> list[str]:
     import subprocess
 
-    cmd = [
+    cmd_base = [
         sys.executable,
         os.path.join(SCRIPT_DIR, "cdp_publish.py"),
         "--host",
@@ -483,6 +535,9 @@ def run_search_covers(
         "search-feeds",
         "--keyword",
         keyword,
+    ]
+    cmd_with_filters = [
+        *cmd_base,
         "--sort-by",
         sort_by,
         "--publish-time",
@@ -490,9 +545,12 @@ def run_search_covers(
         "--note-type",
         note_type,
     ]
-    subprocess_timeout = max(120, 180)
+    subprocess_timeout = max(120, 300)
     last_out = ""
-    for attempt in range(1, 4):
+    max_attempts = max(1, int(search_retries))
+    fallback_attempted = False
+
+    def _run(cmd: list[str]) -> tuple[subprocess.CompletedProcess, str, list[str]]:
         proc = subprocess.run(
             cmd,
             cwd=SCRIPT_DIR,
@@ -503,27 +561,63 @@ def run_search_covers(
             timeout=subprocess_timeout,
         )
         out = (proc.stdout or "") + "\n" + (proc.stderr or "")
-        last_out = out
         urls = _extract_cover_urls_from_search_stdout(out, limit=limit_notes)
+        return proc, out, urls
+
+    for attempt in range(1, max_attempts + 1):
+        proc, out, urls = _run(cmd_with_filters)
+        last_out = out
         if urls:
             if attempt > 1:
                 print(
-                    f"[xhs2picset] search-feeds recovered on attempt {attempt}/3 "
+                    f"[xhs2picset] search-feeds recovered on attempt {attempt}/{max_attempts} "
                     f"({len(urls)} cover URL(s)).",
                     flush=True,
                 )
             return urls
-        if proc.returncode != 0:
+
+        # UI filters are occasionally unavailable on XHS search page.
+        # Fallback to keyword-only search to keep the workflow alive.
+        filter_unavailable = (
+            "filter_button_not_found" in out
+            or "Failed to apply search filter" in out
+        )
+        if filter_unavailable and not fallback_attempted:
+            fallback_attempted = True
             print(
-                f"[xhs2picset] search-feeds exit={proc.returncode} (attempt {attempt}/3)",
+                "[xhs2picset] search filters unavailable; fallback to keyword-only search.",
                 file=sys.stderr,
                 flush=True,
             )
-        if attempt < 3:
+            proc_fb, out_fb, urls_fb = _run(cmd_base)
+            if out_fb:
+                last_out = out_fb
+            if urls_fb:
+                print(
+                    f"[xhs2picset] keyword-only fallback succeeded "
+                    f"({len(urls_fb)} cover URL(s)).",
+                    flush=True,
+                )
+                return urls_fb
+
+        if proc.returncode != 0:
+            print(
+                f"[xhs2picset] search-feeds exit={proc.returncode} (attempt {attempt}/{max_attempts})",
+                file=sys.stderr,
+                flush=True,
+            )
+            tail = (out or "").strip()[-600:]
+            if tail:
+                print(
+                    f"[xhs2picset] search-feeds stderr:\n{tail}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        if attempt < max_attempts:
             backoff = float(attempt * 4)
             print(
                 f"[xhs2picset] search-feeds returned 0 covers; backoff {backoff:.0f}s then retry "
-                f"({attempt + 1}/3)...",
+                f"({attempt + 1}/{max_attempts})...",
                 file=sys.stderr,
                 flush=True,
             )
@@ -601,6 +695,12 @@ def main() -> None:
         help="Max notes to take cover images from (keyword mode).",
     )
     parser.add_argument(
+        "--search-retries",
+        type=int,
+        default=1,
+        help="Retry count for keyword search cover fetch (default: 1).",
+    )
+    parser.add_argument(
         "--max-images",
         type=int,
         default=12,
@@ -649,8 +749,8 @@ def main() -> None:
         help="Local host: restart Chrome using given --account before operations. "
         "Default OFF to keep the browser windows alive during multi-account runs.",
     )
-    parser.add_argument("--picset-url", default=DEFAULT_PICSET_CN)
-    parser.add_argument("--login-timeout", type=int, default=120)
+    parser.add_argument("--picset-url", default=DEFAULT_PICSET_URL)
+    parser.add_argument("--login-timeout", type=int, default=60)
     parser.add_argument(
         "--skip-upload",
         action="store_true",
@@ -664,6 +764,16 @@ def main() -> None:
         help=(
             "Local product/SKU images uploaded to Picset 「产品素材图」(after reference uploads). "
             "Pass every run when the page requires product materials."
+        ),
+    )
+    parser.add_argument(
+        "--reference-images",
+        nargs="+",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Local reference images used as 「参考设计图」. "
+            "When provided, skips XHS search/download and uses these files directly."
         ),
     )
     parser.add_argument(
@@ -784,9 +894,8 @@ def main() -> None:
         "--photoshop-after-generate",
         action="store_true",
         help=(
-            "需同时 --generate：Picset「生成图」下载到本机后，再对该目录下生成文件做 Photoshop "
-            "「图像→自动色调/对比度/颜色」等价的 JSX 批处理（需 PS + pywin32）；"
-            "发布与 summary 优先使用处理后路径。"
+            "需同时 --generate：Picset「生成图」下载到本机后，改为代码自动调色（Pillow）;"
+            "不再依赖 Photoshop。发布与 summary 优先使用处理后路径。"
         ),
     )
     parser.add_argument(
@@ -917,6 +1026,17 @@ def main() -> None:
             sys.exit(2)
         print(f"[xhs2picset] Product material files: {len(product_paths)}")
 
+    reference_paths: list[str] = []
+    if args.reference_images:
+        reference_paths = _resolve_existing_files(list(args.reference_images))
+        if not reference_paths:
+            print(
+                "Error: --reference-images given but no valid files found.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        print(f"[xhs2picset] Using pre-downloaded reference images: {len(reference_paths)}")
+
     prefer_shop = getattr(args, "prefer_ecommerce_covers", True)
     kw_pull = int(args.limit_notes)
     if prefer_shop and args.keyword:
@@ -946,6 +1066,12 @@ def main() -> None:
                 "prefer_ecommerce_pull": prefer_shop,
             },
         )
+        if _is_local_host(args.host):
+            ensure_chrome(
+                port=args.port,
+                headless=args.headless,
+                account=args.account,
+            )
         urls = run_search_covers(
             keyword=args.keyword.strip(),
             sort_by=args.sort_by,
@@ -956,6 +1082,7 @@ def main() -> None:
             publish_time=str(args.publish_time),
             note_type=str(args.note_type),
             reuse_existing_tab=bool(args.reuse_existing_tab),
+            search_retries=int(args.search_retries),
         )
         _debug_log(
             "H14",
@@ -972,46 +1099,50 @@ def main() -> None:
         urls = urls[:mi]
     # keyword + prefer_shop: download all URLs returned up to kw_pull cap
     paths: list[str] = []
-    if not urls:
+    if reference_paths:
+        paths = reference_paths
+        print(f"[xhs2picset] Using {len(paths)} pre-downloaded reference images (skipped XHS search).")
+    elif not urls:
         if args.strict_step_lock:
             print(
                 "[xhs2picset] Error: search returned 0 URLs under strict-step-lock; abort.",
                 file=sys.stderr,
             )
             sys.exit(2)
-        # Fallback: when home feed search is blocked (e.g. IP risk / NOT_LOGGED_IN),
-        # reuse the last successful local reference images so Picset can still generate.
-        cached_paths: list[str] = []
-        if args.summary_json:
-            summary_p = Path(args.summary_json)
-            if summary_p.is_file():
-                try:
-                    payload = json.loads(summary_p.read_text(encoding="utf-8"))
-                    cached_paths = (
-                        payload.get("reference_local_paths")
-                        or payload.get("local_paths")
-                        or []
-                    )
-                except Exception:
-                    cached_paths = []
-        cached_paths = [
-            str(p)
-            for p in cached_paths
-            if p and isinstance(p, str) and Path(p).is_file()
-        ]
-        if cached_paths:
-            paths = cached_paths[: max(1, args.max_images)]
-            print(
-                "[xhs2picset] No image URLs collected from search; "
-                "reusing cached reference_local_paths from summary-json.",
-                flush=True,
-            )
         else:
-            print("[xhs2picset] No image URLs collected (and no cached references).", file=sys.stderr)
-            sys.exit(2)
+            # Fallback: when home feed search is blocked (e.g. IP risk / NOT_LOGGED_IN),
+            # reuse the last successful local reference images so Picset can still generate.
+            cached_paths: list[str] = []
+            if args.summary_json:
+                summary_p = Path(args.summary_json)
+                if summary_p.is_file():
+                    try:
+                        payload = json.loads(summary_p.read_text(encoding="utf-8"))
+                        cached_paths = (
+                            payload.get("reference_local_paths")
+                            or payload.get("local_paths")
+                            or []
+                        )
+                    except Exception:
+                        cached_paths = []
+            cached_paths = [
+                str(p)
+                for p in cached_paths
+                if p and isinstance(p, str) and Path(p).is_file()
+            ]
+            if cached_paths:
+                paths = cached_paths[: max(1, args.max_images)]
+                print(
+                    "[xhs2picset] No image URLs collected from search; "
+                    "reusing cached reference_local_paths from summary-json.",
+                    flush=True,
+                )
+            else:
+                print("[xhs2picset] No image URLs collected (and no cached references).", file=sys.stderr)
+                sys.exit(2)
     else:
         downloader = ImageDownloader(temp_dir=output_dir)
-        paths = downloader.download_all(urls)
+        paths = downloader.download_all(urls, referer="https://www.xiaohongshu.com/")
     print(f"[xhs2picset] Downloaded {len(paths)} file(s)." )
 
     # Prefer e-commerce-ish photos vs typography / poster covers; optionally combine with
@@ -1238,6 +1369,41 @@ def main() -> None:
             phase="进入工作台后",
         )
 
+        def _recover_picset_connection(retry_index: int, exc: BaseException) -> None:
+            if not _is_transient_cdp_disconnect(exc):
+                return
+            print(
+                f"[xhs2picset] Recovering Picset CDP connection (retry={retry_index})...",
+                file=sys.stderr,
+                flush=True,
+            )
+            last_exc: BaseException | None = None
+            for conn_try in range(1, 4):
+                try:
+                    try:
+                        publisher.disconnect()
+                    except Exception:
+                        pass
+                    publisher.connect(
+                        target_url_prefix="https://picsetai",
+                        reuse_existing_tab=args.reuse_existing_tab,
+                    )
+                    # Hook may be lost after reconnect; reinstall for generated URL capture.
+                    if args.generate:
+                        _install_network_image_hooks(publisher)
+                    print(
+                        f"[xhs2picset] CDP reconnect ok (attempt={conn_try})",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    return
+                except Exception as recover_exc:
+                    last_exc = recover_exc
+                    time.sleep(1.0)
+            raise RuntimeError(
+                f"cdp_reconnect_failed_after_retries: {last_exc}"
+            )
+
         # Do NOT install fetch/XHR hooks until uploads finish — patching network during
         # file upload has been observed to destabilize Picset (session / kicked to login).
 
@@ -1287,11 +1453,14 @@ def main() -> None:
         photoshop_gen_meta: dict[str, Any] | None = None
 
         if args.generate:
+            prompt_source = "default"
             if args.prompt_file:
                 with open(args.prompt_file, encoding="utf-8") as f:
                     gen_prompt = f.read().strip()
+                prompt_source = "prompt_file"
             elif args.prompt:
                 gen_prompt = args.prompt.strip()
+                prompt_source = "prompt_inline"
             else:
                 gen_prompt = (
                     "参考已上传图片的风格与排版，生成一张电商详情主图，"
@@ -1300,6 +1469,18 @@ def main() -> None:
             if not gen_prompt:
                 print("Error: empty prompt for --generate.", file=sys.stderr)
                 sys.exit(2)
+            if prompt_source == "prompt_inline" and _prompt_looks_corrupted(gen_prompt):
+                print(
+                    "Error: prompt looks encoding-corrupted from CLI input. "
+                    "Please use --prompt-file (UTF-8) instead of inline --prompt.",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+            print(
+                f"[xhs2picset] Prompt source={prompt_source}, "
+                f"length={len(gen_prompt)}",
+                flush=True,
+            )
 
             want = max(1, args.max_download)
             batch_ui = (
@@ -1312,6 +1493,7 @@ def main() -> None:
             ui_pick = _retry_on_cdp_promise_collected(
                 lambda: _picset_try_set_batch_count(publisher, batch_ui),
                 label="set_batch_count",
+                on_retry=_recover_picset_connection,
             )
             print(
                 "[xhs2picset] Picset 「生成张数」界面（尽力切换）:",
@@ -1345,6 +1527,7 @@ def main() -> None:
                         batch_hint=batch_ui,
                     ),
                     label="fill_prompt_and_generate_one_shot",
+                    on_retry=_recover_picset_connection,
                 )
                 print(
                     "[xhs2picset] Generate trigger (one-shot, UI batch=%d):"
@@ -1354,6 +1537,15 @@ def main() -> None:
                 if not trigger.get("ok"):
                     raise RuntimeError(
                         "Picset: prompt input or generate button not found (see trigger JSON)."
+                    )
+                if not bool(trigger.get("promptConfirmed")):
+                    raise RuntimeError(
+                        "Picset prompt was not confirmed in input box; stop before generation."
+                    )
+                clicked_tag = str(trigger.get("clickedTag") or "").lower()
+                if clicked_tag and clicked_tag not in {"button", "a"}:
+                    raise RuntimeError(
+                        f"Picset generate click target is not actionable button: clickedTag={clicked_tag!r}."
                     )
                 clicked_label = str(trigger.get("clickedLabel") or "")
                 if batch_ui > 1 and str(batch_ui) not in clicked_label:
@@ -1370,6 +1562,7 @@ def main() -> None:
                         min_count=min(want, batch_ui),
                     ),
                     label="collect_generated_urls_one_shot",
+                    on_retry=_recover_picset_connection,
                 )
                 for u in batch:
                     if not (isinstance(u, str) and u.startswith("http")):
@@ -1411,6 +1604,7 @@ def main() -> None:
                         batch_hint=None,
                     ),
                     label="fill_prompt_and_generate_fallback",
+                    on_retry=_recover_picset_connection,
                 )
                 rounds_done += 1
                 print(
@@ -1422,6 +1616,15 @@ def main() -> None:
                     raise RuntimeError(
                         "Picset: prompt input or generate button not found (see trigger JSON)."
                     )
+                if not bool(trigger.get("promptConfirmed")):
+                    raise RuntimeError(
+                        "Picset prompt was not confirmed in input box; stop before generation."
+                    )
+                clicked_tag = str(trigger.get("clickedTag") or "").lower()
+                if clicked_tag and clicked_tag not in {"button", "a"}:
+                    raise RuntimeError(
+                        f"Picset generate click target is not actionable button: clickedTag={clicked_tag!r}."
+                    )
 
                 batch = _retry_on_cdp_promise_collected(
                     lambda: _collect_generated_image_urls(
@@ -1432,6 +1635,7 @@ def main() -> None:
                         min_count=1,
                     ),
                     label="collect_generated_urls_fallback",
+                    on_retry=_recover_picset_connection,
                 )
                 before_ct = len(accumulated_urls)
                 for u in batch:
@@ -1515,7 +1719,7 @@ def main() -> None:
 
             if args.photoshop_after_generate:
                 print(
-                    "[xhs2picset] Entering Photoshop auto color stage "
+                    "[xhs2picset] Entering code auto color stage "
                     f"with {len(generated_local_paths)} image(s)...",
                     flush=True,
                 )
@@ -1619,12 +1823,10 @@ def main() -> None:
                             file=sys.stderr,
                         )
 
-                from postprocess_xhs_workflow import (
-                    materialize_generated_photoshop_autotcc,
-                )
+                from postprocess_xhs_workflow import materialize_generated_auto_color
 
                 generated_local_paths, photoshop_gen_meta = (
-                    materialize_generated_photoshop_autotcc(
+                    materialize_generated_auto_color(
                         generated_dir_used,
                         generated_local_paths,
                     )
@@ -1705,4 +1907,14 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    _xhs_exit_code = 0
+    try:
+        main()
+    except SystemExit as e:
+        _xhs_exit_code = int(e.code or 0)
+    emit_step_result(StepResult(
+        step_name="step_a_visual_generate",
+        status="success" if _xhs_exit_code == 0 else "failed",
+        artifacts={"exit_code": _xhs_exit_code},
+    ))
+    sys.exit(_xhs_exit_code)

@@ -32,9 +32,6 @@ def _pid_running(pid: int) -> bool:
         return True
     except OSError:
         return False
-    except SystemError:
-        # Windows may raise SystemError for some stale/invalid pids.
-        return False
     return True
 
 

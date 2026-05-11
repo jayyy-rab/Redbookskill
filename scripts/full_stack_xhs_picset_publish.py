@@ -214,7 +214,7 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9222)
     parser.add_argument("--account", default=None)
-    parser.add_argument("--picset-url", default="https://picsetai.cn/")
+    parser.add_argument("--picset-url", default="https://picsetai.com/zh-CN")
     parser.add_argument(
         "--preview-publish",
         action="store_true",

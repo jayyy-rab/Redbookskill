@@ -56,6 +56,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 from env_local_loader import load_env_local
+from workflow_core import emit_step_result, StepResult
 
 # scripts on path
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -566,10 +567,13 @@ def generate_promo_to_dir(
 ) -> tuple[Path, Path]:
     if dry_run:
         title = "【预览】替换为真实标题"
-        tags = ["#示例话题", "#替换为你的标签"]
+        tags = ["#茶叶", "#米酒", "#手工酿造", "#日常分享"]
         body = (
-            "这里是由 --dry-run 生成的占位正文。请配置 DOUBAN_PROMO_API_URL 后重试。\n"
-            "下面最后一行将用于小红书「话题」选择："
+            "今天试了古法手工甜米酒，入口是淡淡米香，冷藏后口感更清爽，搭配茶点很顺。"
+            "早晚小酌都不会腻，朋友来家里也很容易接受。"
+            "如果你在找偏自然风味、拍照又上镜的日常款，这类低门槛搭配会更稳。"
+            "我这次是配了简餐和水果一起喝，层次会更明显，甜度也不会觉得冲。"
+            "新手第一次尝试建议先少量冰镇，口感会更柔和，接受度更高。"
         )
         content_full = _build_content_file(body, tags)
         raw_path = out_dir / "api_response.json" if dump_raw else None
@@ -874,8 +878,15 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    _db_exit_code = 0
     try:
         main()
     except (FileNotFoundError, RuntimeError, ValueError, json.JSONDecodeError) as e:
         print(f"Error: {e}", file=sys.stderr)
-        sys.exit(2)
+        _db_exit_code = 2
+    emit_step_result(StepResult(
+        step_name="step_b_copywriting",
+        status="success" if _db_exit_code == 0 else "failed",
+        artifacts={"exit_code": _db_exit_code},
+    ))
+    sys.exit(_db_exit_code)

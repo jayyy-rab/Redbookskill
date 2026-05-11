@@ -65,7 +65,7 @@ def _download_urls(urls: list[str], output_dir: str | None) -> list[str]:
         return []
     downloader = ImageDownloader(temp_dir=output_dir)
     try:
-        return downloader.download_all(urls)
+        return downloader.download_all(urls, referer="https://picsetai.com/zh-CN")
     finally:
         # Keep files for downstream use when caller provided output_dir.
         # For auto temp dir, do not cleanup so generated assets remain accessible.
@@ -340,10 +340,21 @@ def _picset_session_and_workspace_js() -> str:
           const visible = (el) => !!(el && el.offsetParent !== null);
           const fileInputs = [...document.querySelectorAll('input[type="file"]')].filter(visible).length;
 
+          const visibleTextInputs = [...document.querySelectorAll(
+            'textarea, input[type="text"], [contenteditable="true"]'
+          )].filter(visible).length;
+          const hasGenerateBtn = [...document.querySelectorAll('button,a,[role="button"]')]
+            .filter(visible)
+            .some((el) => {
+              const tx = (el.innerText || el.textContent || '').replace(/\\s+/g, '');
+              return tx.includes('生成') || tx.includes('详情图');
+            });
+          const hasUploadHints =
+            /参考设计图|产品素材图|上传参考|上传产品|拖拽上传|点击上传/.test(raw);
+
           const workspaceReady =
             fileInputs >= 1 ||
-            (t.includes("参考") && (t.includes("设计") || t.includes("图"))) ||
-            t.includes("产品素材");
+            (hasUploadHints && visibleTextInputs >= 1 && hasGenerateBtn);
 
           const hasPwd = !!document.querySelector(
             'input[type="password"], input[name*="password" i], input[placeholder*="密码"]'
@@ -377,6 +388,9 @@ def _picset_session_and_workspace_js() -> str:
             marketingLocked,
             needsClassicLoginOnly,
             fileInputs,
+            visibleTextInputs,
+            hasGenerateBtn,
+            hasUploadHints,
             snippet: t.slice(0, 280),
           };
         })()
@@ -426,11 +440,30 @@ def _require_picset_upload_ui(
     """After clicking entry CTAs, ensure upload slots actually appeared."""
     deadline = time.time() + max(10, timeout_seconds)
     label = f" ({phase})" if phase else ""
+    attempt = 0
     while time.time() < deadline:
+        attempt += 1
         state = _evaluate_js(publisher, _picset_session_and_workspace_js())
         if isinstance(state, dict) and state.get("workspaceReady"):
             print(f"[picset] Upload UI confirmed{label}.")
             return
+
+        # Landing page can render lazily; re-trigger workspace entry periodically
+        # to avoid one-shot click misses.
+        if attempt % 3 == 1:
+            try:
+                _enter_picset_workspace_if_needed(publisher, max_wait_seconds=8)
+            except Exception:
+                pass
+
+        if attempt % 5 == 1 and isinstance(state, dict):
+            print(
+                "[picset] Waiting upload UI"
+                f"{label}: href={state.get('href') or '-'} "
+                f"fileInputs={state.get('fileInputs')} "
+                f"marketingLocked={state.get('marketingLocked')} "
+                f"snippet={(state.get('snippet') or '')[:80]}"
+            )
         time.sleep(2)
 
     raise RuntimeError(
@@ -603,138 +636,501 @@ def _fill_prompt_and_generate(
     else:
         batch_lit = json.dumps(max(1, min(16, int(batch_hint))))
 
-    result = _evaluate_js(
+    _UTILS = r"""
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const visible = (el) => !!(el && (el.offsetWidth > 0 || el.offsetHeight > 0 || el.getClientRects().length > 0));
+const textOf = (el) => String(el?.innerText || el?.textContent || "").replace(/\s+/g, " ").trim();
+const lc = (s) => String(s || "").toLowerCase();
+const normalize = (s) => lc(String(s || "").replace(/\s+/g, ""));
+const isDisabled = (el) => {
+  if (!el) return true;
+  if (el.disabled) return true;
+  if (el.hasAttribute?.("disabled")) return true;
+  const aria = lc(el.getAttribute?.("aria-disabled") || "");
+  if (aria === "true") return true;
+  const clsRaw = String(el.className || "");
+  const clsTokens = clsRaw.split(/\s+/).map((x) => lc(x)).filter(Boolean);
+  if (clsTokens.includes("disabled") || clsTokens.includes("is-disabled") || clsTokens.includes("ant-btn-disabled")) return true;
+  return false;
+};
+const clickLikeUser = (el) => {
+  if (!el) return false;
+  try { el.scrollIntoView({ block: "center", inline: "center" }); } catch {}
+  try { el.focus?.(); } catch {}
+  try { el.click?.(); } catch {}
+  try {
+    el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+    el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
+    el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+  } catch {}
+  return true;
+};
+"""
+
+    # --- Part 1: batch hint + prompt fill + model trigger rect detection ---
+    part1 = _evaluate_js(
         publisher,
         f"""
         (async () => {{
-          const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-          const visible = (el) => !!(el && el.offsetParent !== null);
+{_UTILS}
           const prompt = {prompt_literal};
           const refs = {refs_literal};
           const batchHint = {batch_lit};
-          let inputFound = false;
-          let generateClicked = false;
 
-          /* Reinforce N 张（含 1 张）right before 写入 prompt（与 _picset_try_set_batch_count 互补）*/
+          let inputFound = false;
+          let promptConfirmed = false;
+          let selectedInputTag = "";
+          let selectedInputHint = "";
+
+          // --- Batch hint ---
           if (batchHint >= 1) {{
-            const clickable = [...document.querySelectorAll('button,[role=\"button\"],label,span,[role=\"radio\"]')]
+            const clickable = [...document.querySelectorAll('button,[role="button"],label,span,[role="radio"]')]
               .filter(visible);
             for (const el of clickable) {{
-              const raw = (el.innerText || el.textContent || '').trim().replace(/\\s+/g, '');
+              const raw = normalize(textOf(el));
               if (!raw) continue;
-              if (raw.includes(String(batchHint) + '张') || raw.includes(batchHint + '张详情')) {{
-                el.click();
+              if (raw.includes(String(batchHint) + "\u5f20")) {{
+                clickLikeUser(el);
                 await sleep(350);
                 break;
               }}
             }}
           }}
 
+          // --- Prompt input ---
           const inputs = [
-            ...document.querySelectorAll('textarea'),
+            ...document.querySelectorAll("textarea"),
             ...document.querySelectorAll('[contenteditable="true"]'),
             ...document.querySelectorAll('input[type="text"]'),
-          ].filter(visible);
+            ...document.querySelectorAll("input:not([type])"),
+          ].filter((n) => visible(n) && !isDisabled(n));
 
           let target = null;
           for (const node of inputs) {{
-            const ph = (node.getAttribute?.('placeholder') || '').toLowerCase();
-            const text = (node.innerText || '').toLowerCase();
+            const bag = [
+              node.getAttribute?.("placeholder") || "",
+              node.getAttribute?.("aria-label") || "",
+              node.getAttribute?.("name") || "",
+              node.id || "",
+              textOf(node),
+              textOf(node.closest?.("section,div,form,article") || null).slice(0, 400),
+            ]
+              .join(" ")
+              .toLowerCase();
             if (
-              ph.includes('prompt') ||
-              ph.includes('描述') ||
-              ph.includes('请输入') ||
-              text.includes('prompt')
+              bag.includes("prompt") ||
+              bag.includes("\u63cf\u8ff0") ||
+              bag.includes("\u8f93\u5165") ||
+              bag.includes("\u6587\u6848") ||
+              bag.includes("\u63d0\u793a")
             ) {{
               target = node;
               break;
             }}
           }}
-          if (!target && inputs.length > 0) {{
-            target = inputs[0];
-          }}
+          if (!target && inputs.length > 0) target = inputs[0];
 
           if (target) {{
-            target.focus();
-            if (target.tagName === 'TEXTAREA' || target.tagName === 'INPUT') {{
-              target.value = prompt;
-              target.dispatchEvent(new Event('input', {{ bubbles: true }}));
-              target.dispatchEvent(new Event('change', {{ bubbles: true }}));
-            }} else {{
-              target.innerText = prompt;
-              target.dispatchEvent(new Event('input', {{ bubbles: true }}));
+            selectedInputTag = lc(target.tagName);
+            selectedInputHint = String(
+              target.getAttribute?.("placeholder") ||
+              target.getAttribute?.("aria-label") ||
+              target.getAttribute?.("name") ||
+              ""
+            ).slice(0, 80);
+            clickLikeUser(target);
+            const readValue = (node) => {{
+              if (!node) return "";
+              const tag = lc(node.tagName);
+              if (tag === "textarea" || tag === "input") {{
+                return String(node.value || "");
+              }}
+              return textOf(node);
+            }};
+            const writePrompt = (node, text) => {{
+              const tag = lc(node?.tagName);
+              if (!node) return;
+              if (tag === "textarea" || tag === "input") {{
+                try {{
+                  if (typeof node.setSelectionRange === "function") {{
+                    node.focus?.();
+                    const len = String(node.value || "").length;
+                    node.setSelectionRange(0, len);
+                  }}
+                }} catch {{}}
+                try {{
+                  const proto =
+                    tag === "textarea"
+                      ? window.HTMLTextAreaElement?.prototype
+                      : window.HTMLInputElement?.prototype;
+                  const setter = proto && Object.getOwnPropertyDescriptor(proto, "value")?.set;
+                  if (setter) {{
+                    setter.call(node, text);
+                  }} else {{
+                    node.value = text;
+                  }}
+                }} catch {{
+                  node.value = text;
+                }}
+                node.dispatchEvent(new Event("input", {{ bubbles: true }}));
+                node.dispatchEvent(new Event("change", {{ bubbles: true }}));
+                return;
+              }}
+              node.innerText = text;
+              node.dispatchEvent(new InputEvent("input", {{ bubbles: true, data: text }}));
+            }};
+            const tag = lc(target.tagName);
+            writePrompt(target, prompt);
+            if (tag === "textarea" || tag === "input") {{
+              target.dispatchEvent(new KeyboardEvent("keyup", {{ bubbles: true, key: "Enter" }}));
             }}
             inputFound = true;
-          }}
 
-          await sleep(500);
-
-          const buttonKeywords = ['开始生成', '立即生成', '生成', 'generate', 'create'];
-          const excludeKeywords = ['q ', '版权归谁', '常见问题', 'faq', 'close', '登录', '注册', '立即体验', '免费试用', '开始风格复刻'];
-          const buttons = [
-            ...document.querySelectorAll('button'),
-            ...document.querySelectorAll('[role="button"]'),
-            ...document.querySelectorAll('a'),
-          ].filter(visible);
-
-          let clickedLabel = '';
-          for (const btn of buttons) {{
-            const text = (btn.innerText || btn.textContent || '').trim().toLowerCase();
-            if (!text) continue;
-            if (excludeKeywords.some((k) => text.includes(k))) continue;
-            if (buttonKeywords.some((k) => text.includes(k))) {{
-              btn.click();
-              generateClicked = true;
-              clickedLabel = text;
-              break;
+            const promptNorm = normalize(prompt);
+            const minProbeLen = Math.min(10, promptNorm.length);
+            const probe = promptNorm.slice(0, minProbeLen);
+            const hasPrompt = () => {{
+              const cur = normalize(readValue(target));
+              return !!probe && cur.includes(probe);
+            }};
+            promptConfirmed = hasPrompt();
+            if (!promptConfirmed) {{
+              for (let i = 0; i < 2 && !promptConfirmed; i += 1) {{
+                if (tag === "textarea" || tag === "input") {{
+                  try {{
+                    target.focus?.();
+                    target.select?.();
+                    document.execCommand?.("insertText", false, prompt);
+                  }} catch {{}}
+                }}
+                writePrompt(target, prompt);
+                await sleep(220);
+                promptConfirmed = hasPrompt();
+              }}
             }}
           }}
 
+          // Early return if prompt not confirmed
+          if (!promptConfirmed) {{
+            return {{
+              inputFound,
+              promptConfirmed: false,
+              selectedInputTag,
+              selectedInputHint,
+              referenceCount: refs.length,
+            }};
+          }}
+
+          await sleep(700);
+
           return {{
-            ok: inputFound && generateClicked,
             inputFound,
-            generateClicked,
-            clickedLabel,
-            referenceCount: refs.length
+            promptConfirmed,
+            selectedInputTag,
+            selectedInputHint,
+            referenceCount: refs.length,
           }};
         }})()
         """,
     )
-    if not isinstance(result, dict):
-        raise RuntimeError("Unexpected JS result when triggering generation.")
-    return result
 
+    if not isinstance(part1, dict):
+        raise RuntimeError("Unexpected JS result in Part 1.")
 
-def _enter_picset_workspace_if_needed(publisher: XiaohongshuPublisher) -> None:
-    result = _evaluate_js(
+    # Extract Part 1 state
+    p1_inputFound = bool(part1.get("inputFound"))
+    p1_promptConfirmed = bool(part1.get("promptConfirmed"))
+    p1_selectedInputTag = str(part1.get("selectedInputTag") or "")
+    p1_selectedInputHint = str(part1.get("selectedInputHint") or "")
+    p1_referenceCount = int(part1.get("referenceCount") or 0)
+
+    # Prompt not confirmed -> early return
+    if not p1_promptConfirmed:
+        result = {
+            "ok": False,
+            "inputFound": p1_inputFound,
+            "generateClicked": False,
+            "clickedLabel": "",
+            "clickedTag": "",
+            "selectedInputTag": p1_selectedInputTag,
+            "selectedInputHint": p1_selectedInputHint,
+            "referenceCount": p1_referenceCount,
+            "candidates": [],
+            "promptConfirmed": False,
+            "candidatesRetryScrolled": False,
+            "reason": "prompt_not_confirmed",
+        }
+        print(
+            "[picset] Prompt/generate check: "
+            f"inputFound={p1_inputFound}, "
+            f"promptConfirmed=False, "
+            f"generateClicked=False, "
+            f"reason=prompt_not_confirmed, "
+            f"selectedInputTag={p1_selectedInputTag}, "
+            f"selectedInputHint={p1_selectedInputHint}, "
+            f"clickedTag=, "
+            f"clickedLabel=, "
+            f"candidates=0, "
+            f"candidatesRetryScrolled=False"
+        )
+        return result
+
+    # --- Part 2: generate button ---
+    part2 = _evaluate_js(
         publisher,
-        """
-        (() => {
-          const href = window.location.href || '';
-          const hasPromptInput = !!document.querySelector('textarea, [contenteditable="true"], input[type="text"]');
-          if (hasPromptInput && !href.endsWith('/')) {
-            return { switched: false, reason: 'already_workspace', href };
-          }
+        f"""
+        (async () => {{
+{_UTILS}
+          const referenceCount = {json.dumps(p1_referenceCount)};
 
-          const visible = (el) => !!(el && el.offsetParent !== null);
-          const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
-          const candidates = [...document.querySelectorAll('a,button,[role="button"]')].filter(visible);
-          const priority = ['开始风格复刻', '风格复刻', '立即体验', '免费试用', '开始全品类商品图'];
-          for (const key of priority) {
-            const node = candidates.find((el) => textOf(el).includes(key));
-            if (node) {
-              node.click();
-              return { switched: true, reason: 'clicked_entry', key, hrefBefore: href };
-            }
-          }
-          return { switched: false, reason: 'entry_not_found', href };
-        })()
+          // --- Generate button ---
+          const includeKeys = [
+            "\u5f00\u59cb\u751f\u6210",
+            "\u7acb\u5373\u751f\u6210",
+            "\u751f\u6210",
+            "\u751f\u56fe",
+            "\u8be6\u60c5\u56fe",
+            "generate",
+            "create",
+            "render"
+          ].map(normalize);
+          const excludeKeys = [
+            "faq",
+            "close",
+            "\u767b\u5f55",
+            "\u6ce8\u518c",
+            "\u7acb\u5373\u4f53\u9a8c",
+            "\u514d\u8d39\u8bd5\u7528",
+            "\u4e0a\u4f20",
+            "\u53c2\u8003\u8bbe\u8ba1\u56fe",
+            "\u4ea7\u54c1\u7d20\u6750\u56fe",
+          ].map(normalize);
+          const configPenaltyKeys = [
+            "\u751f\u6210\u6570\u91cf",
+            "\u5c3a\u5bf8",
+            "\u6e05\u6670\u5ea6",
+            "\u6a21\u578b",
+            "\u901f\u5ea6",
+            "\u6bd4\u4f8b",
+            "\u79ef\u5206",
+          ].map(normalize);
+
+          const pickClickable = (el) => {{
+            if (!el) return null;
+            const direct = el.closest?.("button,[role='button'],a") || el;
+            return direct;
+          }};
+          const isActionable = (el) => {{
+            if (!el) return false;
+            const tag = lc(el.tagName);
+            if (tag === "button" || tag === "a") return true;
+            const role = lc(el.getAttribute?.("role") || "");
+            if (role === "button" || role === "tab" || role === "menuitem") return true;
+            if (typeof el.onclick === "function") return true;
+            const cls = lc(String(el.className || ""));
+            if (cls.includes("btn") || cls.includes("button")) return true;
+            return false;
+          }};
+
+          const collectGenerateCandidates = () => {{
+            const rawCandidates = [
+              ...document.querySelectorAll("button, [role='button'], a, [onclick], div, span"),
+            ].filter(visible);
+            const scored = [];
+            for (const node of rawCandidates) {{
+              const btn = pickClickable(node);
+              if (!btn || !visible(btn) || isDisabled(btn)) continue;
+
+              const meta = [
+                textOf(btn),
+                btn.getAttribute?.("aria-label") || "",
+                btn.getAttribute?.("title") || "",
+                btn.getAttribute?.("data-testid") || "",
+                btn.getAttribute?.("id") || "",
+                btn.getAttribute?.("class") || "",
+              ].join(" ");
+              const nm = normalize(meta);
+              if (!nm) continue;
+              if (excludeKeys.some((k) => k && nm.includes(k))) continue;
+
+              let score = 0;
+              for (const k of includeKeys) {{
+                if (k && nm.includes(k)) score += (k === normalize("\u751f\u6210") ? 2 : 4);
+              }}
+              for (const k of configPenaltyKeys) {{
+                if (k && nm.includes(k)) score -= 2;
+              }}
+              if (nm.includes(normalize("\u751f\u6210")) && nm.includes(normalize("\u8be6\u60c5\u56fe"))) score += 6;
+              if (nm.includes(normalize("\u5f00\u59cb\u751f\u6210")) || nm.includes(normalize("\u7acb\u5373\u751f\u6210"))) score += 8;
+              if (isActionable(btn)) {{
+                score += 2;
+              }} else {{
+                score -= 6;
+              }}
+              if (nm.length > 80) score -= 3;
+              if (score <= 0) continue;
+
+              const rect = btn.getBoundingClientRect?.() || {{ x: 0, y: 0, width: 0, height: 0 }};
+              scored.push({{
+                btn,
+                score,
+                label: textOf(btn) || meta.slice(0, 120),
+                tag: lc(btn.tagName),
+                x: rect.x || 0,
+                y: rect.y || 0,
+                area: Math.max(0, (rect.width || 0) * (rect.height || 0)),
+              }});
+            }}
+            scored.sort((a, b) => (b.score - a.score) || (b.area - a.area) || (a.y - b.y));
+            return scored;
+          }};
+
+          let candidatesRetryScrolled = false;
+          let scored = collectGenerateCandidates();
+          if (scored.length === 0) {{
+            candidatesRetryScrolled = true;
+            try {{
+              window.scrollBy({{ top: Math.max(700, window.innerHeight || 800), behavior: "instant" }});
+            }} catch {{}}
+            await sleep(350);
+            scored = collectGenerateCandidates();
+          }}
+
+          const top = scored.slice(0, 5).map((x) => ({{
+            score: x.score,
+            label: x.label,
+            tag: x.tag,
+            x: Math.round(x.x),
+            y: Math.round(x.y),
+            area: Math.round(x.area),
+          }}));
+
+          let generateClicked = false;
+          let clickedLabel = "";
+          let clickedTag = "";
+          for (const c of scored) {{
+            clickLikeUser(c.btn);
+            await sleep(220);
+            generateClicked = true;
+            clickedLabel = c.label;
+            clickedTag = c.tag || "";
+            break;
+          }}
+
+          return {{
+            ok: generateClicked,
+            inputFound: {json.dumps(p1_inputFound)},
+            generateClicked,
+            clickedLabel,
+            clickedTag,
+            selectedInputTag: {json.dumps(p1_selectedInputTag)},
+            selectedInputHint: {json.dumps(p1_selectedInputHint)},
+            referenceCount,
+            candidates: top,
+            promptConfirmed: {json.dumps(p1_promptConfirmed)},
+            candidatesRetryScrolled,
+          }};
+        }})()
         """,
     )
-    if isinstance(result, dict) and result.get("switched"):
-        print(f"[picset] Enter workspace via: {result.get('key')}")
-        time.sleep(2.0)
+
+    if not isinstance(part2, dict):
+        raise RuntimeError("Unexpected JS result when triggering generation.")
+
+    result = part2
+    print(
+        "[picset] Prompt/generate check: "
+        f"inputFound={bool(result.get('inputFound'))}, "
+        f"promptConfirmed={bool(result.get('promptConfirmed'))}, "
+        f"generateClicked={bool(result.get('generateClicked'))}, "
+        f"selectedInputTag={result.get('selectedInputTag') or ''}, "
+        f"selectedInputHint={result.get('selectedInputHint') or ''}, "
+        f"clickedTag={result.get('clickedTag') or ''}, "
+        f"clickedLabel={result.get('clickedLabel') or ''}, "
+        f"candidates={len(result.get('candidates') or [])}, "
+        f"candidatesRetryScrolled={bool(result.get('candidatesRetryScrolled'))}"
+    )
+    return result
+
+def _enter_picset_workspace_if_needed(
+    publisher: XiaohongshuPublisher,
+    max_wait_seconds: int = 12,
+) -> dict[str, Any]:
+    deadline = time.time() + max(2, int(max_wait_seconds))
+    last_result: dict[str, Any] = {}
+    while time.time() < deadline:
+        result = _evaluate_js(
+            publisher,
+            """
+            (() => {
+              const href = window.location.href || '';
+              const raw = document.body?.innerText || '';
+              const t = raw.toLowerCase();
+              const visible = (el) => !!(el && el.offsetParent !== null);
+              const fileInputs = [...document.querySelectorAll('input[type="file"]')].filter(visible).length;
+              const visibleTextInputs = [...document.querySelectorAll(
+                'textarea, input[type="text"], [contenteditable="true"]'
+              )].filter(visible).length;
+              const hasGenerateBtn = [...document.querySelectorAll('button,a,[role="button"]')]
+                .filter(visible)
+                .some((el) => {
+                  const tx = (el.innerText || el.textContent || '').replace(/\\s+/g, '');
+                  return tx.includes('生成') || tx.includes('详情图');
+                });
+              const hasUploadHints =
+                /参考设计图|产品素材图|上传参考|上传产品|拖拽上传|点击上传/.test(raw);
+              const hasWorkspaceSignals =
+                fileInputs >= 1 ||
+                (hasUploadHints && visibleTextInputs >= 1 && hasGenerateBtn);
+
+              if (hasWorkspaceSignals) {
+                return { switched: false, reason: 'already_workspace', href, fileInputs };
+              }
+
+              const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+              const candidates = [...document.querySelectorAll('a,button,[role="button"]')].filter(visible);
+              const priority = [
+                '开始风格复刻',
+                '风格复刻',
+                '开始全品类商品图',
+                '开始创作',
+                '立即体验',
+                '免费试用'
+              ];
+              for (const key of priority) {
+                const node = candidates.find((el) => textOf(el).includes(key));
+                if (node) {
+                  node.click();
+                  return {
+                    switched: true,
+                    reason: 'clicked_entry',
+                    key,
+                    hrefBefore: href,
+                    candidatesCount: candidates.length,
+                    bodyLen: (raw || '').length
+                  };
+                }
+              }
+              return {
+                switched: false,
+                reason: 'entry_not_found',
+                href,
+                candidatesCount: candidates.length,
+                bodyLen: (raw || '').length
+              };
+            })()
+            """,
+        )
+        if isinstance(result, dict):
+            last_result = result
+            if result.get("switched"):
+                print(f"[picset] Enter workspace via: {result.get('key')}")
+                time.sleep(2.0)
+                return result
+            if result.get("reason") == "already_workspace":
+                return result
+        time.sleep(1.2)
+    return last_result
 
 
 def _find_file_input_node_id(
@@ -746,9 +1142,26 @@ def _find_file_input_node_id(
         target_kind = "reference"
 
     if target_kind == "reference":
-        include_keywords = ["参考设计图", "参考图", "风格", "样式", "style"]
+        include_keywords = [
+            "?????",
+            "???",
+            "??",
+            "??",
+            "??",
+            "reference",
+            "style",
+        ]
     else:
-        include_keywords = ["产品素材图", "产品图", "商品图", "product", "sku"]
+        include_keywords = [
+            "?????",
+            "???",
+            "???",
+            "??",
+            "??",
+            "product",
+            "sku",
+            "material",
+        ]
 
     js = """
         (() => {
@@ -756,6 +1169,8 @@ def _find_file_input_node_id(
           const allInputs = [...document.querySelectorAll('input[type="file"]')];
           const inputs = allInputs.filter(visible);
           const includeKeywords = __INCLUDE_KEYWORDS__;
+          const targetKind = __TARGET_KIND__;
+
           const scoreInput = (el) => {
             const wrap = el.closest('div,section,form');
             const scope = ((wrap?.innerText || '') + ' ' + (el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('name') || '')).toLowerCase();
@@ -775,13 +1190,23 @@ def _find_file_input_node_id(
             .map((el) => ({ el, score: scoreInput(el) }))
             .sort((a, b) => b.score - a.score);
 
-          const input = (sortedVisible[0]?.score || 0) > 0
-                ? sortedVisible[0].el
-                : ((sortedAll[0]?.score || 0) > 0
-                    ? sortedAll[0].el
-                    : (inputs[0] || allInputs[0] || null));
+          let input = null;
+          if ((sortedVisible[0]?.score || 0) > 0) {
+            input = sortedVisible[0].el;
+          } else if ((sortedAll[0]?.score || 0) > 0) {
+            input = sortedAll[0].el;
+          } else {
+            const visibleOrAll = inputs.length ? inputs : allInputs;
+            // Stable fallback by slot order: reference first, product second.
+            if (targetKind === 'reference') {
+              input = visibleOrAll[0] || null;
+            } else {
+              input = visibleOrAll[1] || visibleOrAll[0] || null;
+            }
+          }
+
           if (!input) return null;
-          input.setAttribute('data-picset-upload-target', __TARGET_KIND__);
+          input.setAttribute('data-picset-upload-target', targetKind);
           return 1;
         })()
     """
@@ -1159,7 +1584,7 @@ def main() -> None:
     parser.add_argument("--account", default=None, help="Account name used by existing profile launcher")
     parser.add_argument("--reuse-existing-tab", action="store_true", help="Prefer reusing existing browser tab")
     parser.add_argument("--picset-url", default=PICSET_AUTH_URL, help="Picset entry URL")
-    parser.add_argument("--login-timeout", type=int, default=120, help="Wait seconds for manual login")
+    parser.add_argument("--login-timeout", type=int, default=60, help="Wait seconds for manual login")
     parser.add_argument(
         "--generate-timeout",
         type=int,

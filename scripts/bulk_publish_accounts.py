@@ -13,7 +13,6 @@ Design:
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 import os
@@ -23,6 +22,10 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+
+from core_config import resolve_account_port, resolve_runtime_target
+from core_logger import create_run_logger
+from media_path_utils import dedupe_existing_paths_by_hash, validate_publish_images
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
@@ -91,66 +94,49 @@ def _run(
     *,
     timeout_seconds: int = 0,
 ) -> subprocess.CompletedProcess:
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(cwd),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+
+    def _drain(stream, store, out):
+        for line in iter(stream.readline, ""):
+            out.write(line)
+            out.flush()
+            store.append(line)
+        stream.close()
+
+    import threading
+    t1 = threading.Thread(target=_drain, args=(proc.stdout, stdout_lines, sys.stdout))
+    t2 = threading.Thread(target=_drain, args=(proc.stderr, stderr_lines, sys.stderr))
+    t1.start()
+    t2.start()
+
     try:
-        return subprocess.run(
-            cmd,
-            cwd=str(cwd),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=(max(1, int(timeout_seconds)) if timeout_seconds else None),
-        )
-    except subprocess.TimeoutExpired as exc:
-        timeout_msg = (
-            f"TimeoutExpired: command exceeded {int(timeout_seconds)}s and was terminated.\n"
-            f"cmd={' '.join(cmd)}\n"
-        )
-        return subprocess.CompletedProcess(
-            args=cmd,
-            returncode=124,
-            stdout=(exc.stdout or ""),
-            stderr=(exc.stderr or "") + timeout_msg,
-        )
+        timeout = max(1, int(timeout_seconds)) if timeout_seconds else None
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    finally:
+        t1.join()
+        t2.join()
 
-
-def _dedupe_existing_paths_by_hash(paths: list[str]) -> list[str]:
-    out: list[str] = []
-    seen: set[str] = set()
-    for p in paths:
-        pp = Path(p)
-        if not pp.is_file():
-            continue
-        digest = hashlib.sha256(pp.read_bytes()).hexdigest()
-        if digest in seen:
-            continue
-        seen.add(digest)
-        out.append(str(pp))
-    return out
-
-
-def _validate_publish_images(payload: dict, image_paths: list[str]) -> list[str]:
-    """
-    Guardrail: only allow true generated outputs for publish.
-
-    Avoid publishing raw XHS reference downloads when generation/drawing fails.
-    """
-    generated_root_raw = str(payload.get("generated_output_dir") or "").strip()
-    ref_root_raw = str(payload.get("output_dir") or "").strip()
-    generated_root = Path(generated_root_raw).resolve() if generated_root_raw else None
-    ref_root = Path(ref_root_raw).resolve() if ref_root_raw else None
-
-    out: list[str] = []
-    for p in image_paths:
-        pp = Path(p).resolve()
-        if not pp.is_file():
-            continue
-        if generated_root and not pp.is_relative_to(generated_root):
-            continue
-        if ref_root and pp.is_relative_to(ref_root):
-            continue
-        out.append(str(pp))
-    return out
+    rc = proc.returncode
+    if rc is None:
+        rc = 124
+    return subprocess.CompletedProcess(
+        args=cmd,
+        returncode=rc,
+        stdout="".join(stdout_lines),
+        stderr="".join(stderr_lines),
+    )
 
 
 def _prepare_once(
@@ -163,7 +149,7 @@ def _prepare_once(
 ) -> tuple[Path, Path, list[str]]:
     TMP_DIR.mkdir(parents=True, exist_ok=True)
 
-    full_stack = SCRIPT_DIR / "full_stack_xhs_picset_publish.py"
+    full_stack = SCRIPT_DIR / "full_stack_orchestrated.py"
     cmd = [
         sys.executable,
         str(full_stack),
@@ -178,7 +164,7 @@ def _prepare_once(
         "--generate-timeout",
         str(max(60, args.generate_timeout)),
         "--step-a-retries",
-        str(max(1, args.step_a_retries)),
+        str(max(0, args.step_a_retries)),
         "--preview-publish",
         "--host",
         str(cdp_host),
@@ -198,7 +184,7 @@ def _prepare_once(
             "--search-feed-timeout",
             str(max(45, int(getattr(args, "search_feed_timeout", 120)))),
             "--discover-max-probes",
-            str(max(2, min(12, int(getattr(args, "discover_max_probes", 4))))),
+            str(max(1, min(12, int(getattr(args, "discover_max_probes", 1))))),
             "--visual-step-timeout",
             str(max(0, int(getattr(args, "visual_step_timeout", 0)))),
         ]
@@ -215,6 +201,10 @@ def _prepare_once(
         cmd.extend(["--brief-file", args.brief_file])
     elif args.brief:
         cmd.extend(["--brief", args.brief])
+    if args.product_name:
+        cmd.extend(["--product-name", args.product_name])
+    if args.product_id:
+        cmd.extend(["--product-id", args.product_id])
 
     acct = prepare_account or "-"
     print(
@@ -236,8 +226,8 @@ def _prepare_once(
 
     payload = json.loads(summary_path.read_text(encoding="utf-8"))
     gen = [Path(p) for p in payload.get("generated_local_paths") or []]
-    gen = _dedupe_existing_paths_by_hash([str(p) for p in gen if p.is_file()])
-    gen = _validate_publish_images(payload, gen)
+    gen = dedupe_existing_paths_by_hash([str(p) for p in gen if p.is_file()])
+    gen = validate_publish_images(payload, gen)
     if len(gen) < max(1, args.max_download):
         raise SystemExit(
             "Need at least "
@@ -249,11 +239,12 @@ def _prepare_once(
 
 def _warn_shared_cdp_port(
     accounts: list[dict], fallback_port: int, host: str
-) -> None:
+) -> bool:
     """Warn when multiple accounts map to the same local CDP port."""
+    has_shared = False
     h = host.strip().lower()
     if h not in {"127.0.0.1", "localhost", "::1"}:
-        return
+        return has_shared
     port_to_names: dict[int, list[str]] = {}
     for row in accounts:
         name = str(row.get("name") or "")
@@ -264,12 +255,14 @@ def _warn_shared_cdp_port(
     for p, names in sorted(port_to_names.items()):
         if len(names) <= 1:
             continue
+        has_shared = True
         print(
             f"[bulk] Warning: accounts {names} share CDP port {p} on {host}. "
             "Each bulk publish run restarts Chrome for the correct profile; "
             "do not run two publish_pipeline processes on that port at once.",
             file=sys.stderr,
         )
+    return has_shared
 
 
 def _publish_one(
@@ -286,13 +279,14 @@ def _publish_one(
     restart_browser_for_account: bool = False,
     timeout_seconds: int = 0,
     expected_nickname: str = "",
+    context_key: str = "",
+    product_name: str = "",
+    product_id: str = "",
 ) -> subprocess.CompletedProcess:
     publish = SCRIPT_DIR / "publish_pipeline.py"
     cmd = [
         sys.executable,
         str(publish),
-        "--account",
-        account,
         "--host",
         host,
         "--port",
@@ -307,6 +301,16 @@ def _publish_one(
         "--images",
         *images,
     ]
+    if account.strip():
+        cmd.extend(["--account", account.strip()])
+    if context_key.strip():
+        cmd.extend(["--context-key", context_key.strip()])
+    if product_name:
+        cmd.extend(["--product-name", product_name])
+        cmd.append("--click-add-product")
+    if product_id:
+        cmd.extend(["--product-id", product_id])
+        cmd.append("--click-add-product")
     if headless:
         cmd.append("--headless")
     if preview:
@@ -416,15 +420,24 @@ def _run_publish_with_retry(
     timing_jitter: float = 0.25,
     restart_browser_for_account: bool = False,
     timeout_seconds: int = 0,
+    use_browser_contexts: bool = False,
+    context_browser_account: str = "",
+    product_name: str = "",
+    product_id: str = "",
 ) -> tuple[bool, int, subprocess.CompletedProcess | None]:
     acc = str(acc_row.get("name"))
-    account_port = int(acc_row.get("port") or fallback_port)
+    if use_browser_contexts:
+        account_port = int(fallback_port)
+    else:
+        account_port = int(resolve_account_port(acc, fallback=fallback_port))
+    publish_account = (context_browser_account.strip() if use_browser_contexts else acc)
+    context_key = (f"xhs:{acc}" if use_browser_contexts else "")
     attempt = 0
     last_proc: subprocess.CompletedProcess | None = None
     while attempt <= max(0, retries):
         attempt += 1
         proc = _publish_one(
-            account=acc,
+            account=publish_account,
             title_file=title_file,
             content_file=content_file,
             images=images,
@@ -436,6 +449,9 @@ def _run_publish_with_retry(
             restart_browser_for_account=restart_browser_for_account,
             timeout_seconds=timeout_seconds,
             expected_nickname=str(acc_row.get("expected_nickname") or ""),
+            context_key=context_key,
+            product_name=product_name,
+            product_id=product_id,
         )
         last_proc = proc
         if proc.returncode == 0:
@@ -446,11 +462,16 @@ def _run_publish_with_retry(
 
 
 def main() -> None:
+    port_explicit = "--port" in sys.argv
+    account_explicit = "--prepare-account" in sys.argv
+
     parser = argparse.ArgumentParser(description="Bulk publish to many XHS accounts")
-    parser.add_argument("--product-images", nargs="+", required=True)
+    parser.add_argument("--product-images", nargs="+", required=False)
     parser.add_argument("--seed-keyword", default=None)
     parser.add_argument("--brief", default=None)
     parser.add_argument("--brief-file", default=None)
+    parser.add_argument("--product-name", default="", help="商品名称，用于发布步骤的商品匹配")
+    parser.add_argument("--product-id", default="", help="商品 ID，精确匹配")
 
     parser.add_argument("--accounts", nargs="*", default=None, help="Account names. Omit to use all.")
     parser.add_argument(
@@ -465,6 +486,11 @@ def main() -> None:
         type=int,
         default=0,
         help="Batch size per window; 0 means all in one window.",
+    )
+    parser.add_argument(
+        "--round-robin",
+        action="store_true",
+        help="Force one-account-per-window rotation (equivalent to --group-size 1).",
     )
     parser.add_argument(
         "--group-window-seconds",
@@ -502,7 +528,7 @@ def main() -> None:
     parser.add_argument(
         "--discover-max-probes",
         type=int,
-        default=4,
+        default=1,
         help="转发 full_stack→visual：recommended_best 时再探测几条候选词（越小越快）",
     )
     parser.add_argument(
@@ -511,7 +537,7 @@ def main() -> None:
         default=0,
         help="转发 full_stack：Step A 整段超时；0=full_stack 按搜词+生图预算自动推算",
     )
-    parser.add_argument("--step-a-retries", type=int, default=2)
+    parser.add_argument("--step-a-retries", type=int, default=0)
     parser.add_argument(
         "--allow-placeholder-preview",
         action="store_true",
@@ -525,7 +551,7 @@ def main() -> None:
     parser.add_argument(
         "--skip-visual-keyword-discover",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help=(
             "转发 full_stack/visual：跳过 Step1 discover 的多轮 search-feeds，"
             "仅用种子关键词走 xhs_images 内一次封面搜索。"
@@ -578,6 +604,17 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9222)
     parser.add_argument(
+        "--use-browser-contexts",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use one Chrome process/port with isolated BrowserContext per account.",
+    )
+    parser.add_argument(
+        "--context-browser-account",
+        default=None,
+        help="When --use-browser-contexts, this account profile launches Chrome (default: prepare-account or default).",
+    )
+    parser.add_argument(
         "--step-timeout-seconds",
         type=int,
         default=5400,
@@ -608,14 +645,53 @@ def main() -> None:
     parser.add_argument(
         "--strict-step-lock",
         action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Hard gate mode (default OFF): if enabled, stop after first failed account. "
+            "By default, continue publishing next accounts when one fails."
+        ),
+    )
+    parser.add_argument(
+        "--continue-on-failure",
+        action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Hard gate mode (default ON): if any account publish step fails, "
-            "do not start subsequent accounts."
+            "Continue to next account immediately after a failed account "
+            "(default ON)."
         ),
     )
 
     args = parser.parse_args()
+    prepare_account_seed = (args.prepare_account or "").strip() or None
+    _, resolved_port, runtime_meta = resolve_runtime_target(
+        host=args.host,
+        port=int(args.port),
+        account=prepare_account_seed,
+        port_explicit=port_explicit,
+        account_explicit=account_explicit,
+    )
+    args.port = int(resolved_port)
+
+    logger = create_run_logger(
+        "bulk_publish_accounts",
+        host=args.host,
+        port=int(args.port),
+        prepare_account=(prepare_account_seed or ""),
+        preview=bool(args.preview),
+    )
+    logger.info(
+        "bulk_start",
+        data={
+            "runtime_meta": runtime_meta,
+            "skip_prepare": bool(args.skip_prepare),
+            "retries": int(args.retries),
+        },
+    )
+
+    if (not args.skip_prepare) and (not args.product_images):
+        parser.error("--product-images is required unless --skip-prepare is used.")
+    if bool(args.round_robin) and int(args.group_size) <= 0:
+        args.group_size = 1
     group_window_plan = _load_group_window_plan(args.group_window_plan_file)
     started_ts = time.time()
 
@@ -628,7 +704,15 @@ def main() -> None:
     if not accounts:
         raise SystemExit("No accounts to publish.")
 
-    _warn_shared_cdp_port(accounts, args.port, args.host)
+    has_shared_port = _warn_shared_cdp_port(accounts, args.port, args.host)
+    effective_restart_browser_for_account = bool(args.restart_browser_for_account) or bool(
+        has_shared_port
+    )
+    if has_shared_port and not bool(args.restart_browser_for_account):
+        print(
+            "[bulk] Auto-enabled --restart-browser-for-account because accounts share local CDP port.",
+            flush=True,
+        )
 
     prepare_cdp: dict | None = None
     if args.skip_prepare:
@@ -636,7 +720,7 @@ def main() -> None:
             raise SystemExit("With --skip-prepare, pass --title-file --content-file --images...")
         title_file = Path(args.title_file)
         content_file = Path(args.content_file)
-        images = _dedupe_existing_paths_by_hash([str(Path(p)) for p in args.images if Path(p).is_file()])
+        images = dedupe_existing_paths_by_hash([str(Path(p)) for p in args.images if Path(p).is_file()])
         if not title_file.is_file() or not content_file.is_file() or not images:
             raise SystemExit("Invalid prepare artifacts for --skip-prepare.")
     else:
@@ -734,8 +818,14 @@ def main() -> None:
                 sleep_max=args.sleep_max,
                 headless=args.publish_headless,
                 timing_jitter=float(args.timing_jitter),
-                restart_browser_for_account=bool(args.restart_browser_for_account),
+                restart_browser_for_account=effective_restart_browser_for_account,
                 timeout_seconds=int(args.step_timeout_seconds),
+                use_browser_contexts=bool(args.use_browser_contexts),
+                context_browser_account=(
+                    str(args.context_browser_account or args.prepare_account or "default")
+                ),
+                product_name=str(args.product_name or ""),
+                product_id=str(args.product_id or ""),
             )
             if ok:
                 report["success"].append({"account": acc, "attempt": attempt, "window": widx})
@@ -749,7 +839,7 @@ def main() -> None:
                         "stderr_tail": (last_proc.stderr[-1200:] if last_proc and last_proc.stderr else ""),
                     }
                 )
-                if args.strict_step_lock:
+                if (not args.continue_on_failure) and args.strict_step_lock:
                     print(
                         f"[bulk] strict-step-lock: stop after failed account={acc}.",
                         file=sys.stderr,
@@ -768,7 +858,7 @@ def main() -> None:
 
     # Compensation passes: retry failed accounts in additional rounds.
     extra_passes = max(0, int(args.retry_failed_pass))
-    if args.strict_step_lock and report["failed"]:
+    if (not args.continue_on_failure) and args.strict_step_lock and report["failed"]:
         extra_passes = 0
     for pass_idx in range(1, extra_passes + 1):
         pending_names = [x.get("account") for x in report["failed"] if x.get("account")]
@@ -798,8 +888,12 @@ def main() -> None:
                 sleep_max=args.sleep_max,
                 headless=args.publish_headless,
                 timing_jitter=float(args.timing_jitter),
-                restart_browser_for_account=bool(args.restart_browser_for_account),
+                restart_browser_for_account=effective_restart_browser_for_account,
                 timeout_seconds=int(args.step_timeout_seconds),
+                use_browser_contexts=bool(args.use_browser_contexts),
+                context_browser_account=(
+                    str(args.context_browser_account or args.prepare_account or "default")
+                ),
             )
             if ok:
                 report["compensation_success"].append(
@@ -827,6 +921,15 @@ def main() -> None:
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"[bulk] report: {report_path}")
     print(f"[bulk] done. ok={report['ok_count']} fail={report['fail_count']}")
+    logger.info(
+        "bulk_done",
+        data={
+            "report_path": str(report_path),
+            "ok_count": int(report["ok_count"]),
+            "fail_count": int(report["fail_count"]),
+            "compensation_ok_count": int(report["compensation_ok_count"]),
+        },
+    )
 
     if report["fail_count"] > 0:
         sys.exit(2)

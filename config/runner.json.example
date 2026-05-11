@@ -1,0 +1,8 @@
+{
+  "runner_account": "runner",
+  "runner_port": 9322,
+  "runner_host": "127.0.0.1",
+  "profile_dir": "C:/Users/YourUsername/AppData/Local/Google/Chrome/XiaohongshuProfiles/runner",
+  "context_mode_default": true,
+  "updated_at": null
+}

@@ -130,23 +130,15 @@ def list_accounts() -> list[dict]:
             "name": name,
             "alias": info.get("alias", ""),
             "profile_dir": info.get("profile_dir", ""),
-            "proxy": info.get("proxy", ""),
-            "port": info.get("port"),
-            "group": info.get("group", ""),
-            "expected_nickname": info.get("expected_nickname", ""),
             "is_default": name == default,
+            "port": info.get("port"),
+            "proxy": info.get("proxy", ""),
+            "group": info.get("group", ""),
         })
     return result
 
 
-def add_account(
-    name: str,
-    alias: Optional[str] = None,
-    proxy: Optional[str] = None,
-    port: Optional[int] = None,
-    group: Optional[str] = None,
-    expected_nickname: Optional[str] = None,
-) -> bool:
+def add_account(name: str, alias: Optional[str] = None) -> bool:
     """
     Add a new account.
 
@@ -167,43 +159,8 @@ def add_account(
     data["accounts"][name] = {
         "alias": alias or name,
         "profile_dir": profile_dir,
-        "proxy": (proxy or "").strip(),
-        "port": int(port) if isinstance(port, int) and port > 0 else None,
-        "group": (group or "").strip(),
-        "expected_nickname": (expected_nickname or "").strip(),
         "created_at": datetime.now().isoformat(),
     }
-    _save_accounts(data)
-    return True
-
-
-def update_account_settings(
-    name: str,
-    *,
-    alias: Optional[str] = None,
-    proxy: Optional[str] = None,
-    port: Optional[int] = None,
-    group: Optional[str] = None,
-    expected_nickname: Optional[str] = None,
-) -> bool:
-    """Update selected account settings. None means keep old value."""
-    data = _load_accounts()
-    if name not in data["accounts"]:
-        return False
-
-    info = data["accounts"][name]
-    if alias is not None:
-        info["alias"] = alias.strip()
-    if proxy is not None:
-        info["proxy"] = proxy.strip()
-    if port is not None:
-        info["port"] = int(port) if int(port) > 0 else None
-    if group is not None:
-        info["group"] = group.strip()
-    if expected_nickname is not None:
-        info["expected_nickname"] = expected_nickname.strip()
-
-    data["accounts"][name] = info
     _save_accounts(data)
     return True
 
@@ -256,6 +213,26 @@ def get_account_info(name: str) -> Optional[dict]:
     return info
 
 
+def get_account_port(account_name: Optional[str] = None, fallback: int = 9222) -> int:
+    """
+    Resolve configured CDP port for an account.
+
+    If account has no valid port configured, return fallback.
+    """
+    data = _load_accounts()
+    if account_name is None:
+        account_name = data.get("default_account", DEFAULT_PROFILE_NAME)
+    info = data.get("accounts", {}).get(account_name, {}) if isinstance(data, dict) else {}
+    raw = info.get("port")
+    try:
+        val = int(raw)
+        if val > 0:
+            return val
+    except Exception:
+        pass
+    return int(fallback)
+
+
 def account_exists(name: str) -> bool:
     """Check if an account exists."""
     data = _load_accounts()
@@ -279,18 +256,6 @@ def main():
     p_add = sub.add_parser("add", help="Add a new account")
     p_add.add_argument("name", help="Account name (unique identifier)")
     p_add.add_argument("--alias", help="Display name / description")
-    p_add.add_argument("--proxy", help="Proxy URL, e.g. http://user:pass@host:port")
-    p_add.add_argument("--port", type=int, help="Preferred local CDP port for this account")
-    p_add.add_argument("--group", help="Optional group tag for batch scheduling")
-    p_add.add_argument("--expected-nickname", help="Expected Xiaohongshu nickname for pre-publish guard")
-
-    p_upd = sub.add_parser("update", help="Update account settings")
-    p_upd.add_argument("name", help="Account name")
-    p_upd.add_argument("--alias", help="Display name / description")
-    p_upd.add_argument("--proxy", help="Proxy URL, empty string clears existing proxy")
-    p_upd.add_argument("--port", type=int, help="Preferred local CDP port; <=0 clears")
-    p_upd.add_argument("--group", help="Optional group tag")
-    p_upd.add_argument("--expected-nickname", help="Expected Xiaohongshu nickname for pre-publish guard")
 
     # remove
     p_rm = sub.add_parser("remove", help="Remove an account")
@@ -318,47 +283,19 @@ def main():
             print("No accounts configured.")
             return
         print(f"{'Name':<20} {'Alias':<20} {'Default':<10}")
-        print("-" * 90)
+        print("-" * 50)
         for acc in accounts:
             default_mark = "*" if acc["is_default"] else ""
-            proxy_mark = "yes" if acc.get("proxy") else "no"
-            port_mark = str(acc.get("port") or "-")
-            group_mark = acc.get("group") or "-"
-            nick_mark = acc.get("expected_nickname") or "-"
-            print(
-                f"{acc['name']:<20} {acc['alias']:<20} {default_mark:<10} "
-                f"proxy={proxy_mark:<3} port={port_mark:<6} group={group_mark:<6} expected_nickname={nick_mark}"
-            )
+            print(f"{acc['name']:<20} {acc['alias']:<20} {default_mark:<10}")
 
     elif args.command == "add":
-        if add_account(
-            args.name,
-            args.alias,
-            args.proxy,
-            args.port,
-            args.group,
-            args.expected_nickname,
-        ):
+        if add_account(args.name, args.alias):
             print(f"Account '{args.name}' added.")
             print(f"Profile dir: {get_profile_dir(args.name)}")
             print("\nTo log in to this account, run:")
             print(f"  python cdp_publish.py --account {args.name} login")
         else:
             print(f"Error: Account '{args.name}' already exists.", file=sys.stderr)
-            sys.exit(1)
-
-    elif args.command == "update":
-        if update_account_settings(
-            args.name,
-            alias=args.alias,
-            proxy=args.proxy,
-            port=args.port,
-            group=args.group,
-            expected_nickname=args.expected_nickname,
-        ):
-            print(f"Account '{args.name}' updated.")
-        else:
-            print(f"Error: Account '{args.name}' not found.", file=sys.stderr)
             sys.exit(1)
 
     elif args.command == "remove":
@@ -374,10 +311,6 @@ def main():
             print(f"Name: {info['name']}")
             print(f"Alias: {info.get('alias', '')}")
             print(f"Profile dir: {info.get('profile_dir', '')}")
-            print(f"Proxy: {info.get('proxy', '') or '-'}")
-            print(f"Port: {info.get('port') or '-'}")
-            print(f"Group: {info.get('group', '') or '-'}")
-            print(f"Expected nickname: {info.get('expected_nickname', '') or '-'}")
             print(f"Default: {'Yes' if info.get('is_default') else 'No'}")
             print(f"Created: {info.get('created_at', 'Unknown')}")
         else:

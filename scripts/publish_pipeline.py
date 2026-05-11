@@ -75,6 +75,7 @@ from image_downloader import ImageDownloader
 from license_client import LicenseClient, LicenseError
 from local_license import LocalLicenseError, validate_local_license_file
 from run_lock import SingleInstanceError, single_instance
+from workflow_core import emit_step_result, StepResult
 
 
 MAX_TIMING_JITTER_RATIO = 0.7
@@ -451,6 +452,12 @@ def main():
         action="store_true",
         default=(os.environ.get("XHS_CLICK_ADD_PRODUCT", "").strip().lower() in {"1", "true", "yes", "on"}),
         help="Click add-product button once before publish (best-effort).",
+    )
+    parser.add_argument(
+        "--skip-form-fill",
+        action="store_true",
+        default=False,
+        help="Skip form fill (navigate + upload + title/body). Reuse existing filled form state.",
     )
 
     # Headless mode
@@ -873,24 +880,30 @@ def main():
         )
         print(f"[pipeline] Step 3: Using {len(image_paths)} local image(s).")
 
-    # --- Step 4: Fill form ---
-    print("[pipeline] Step 4: Filling form...")
-    try:
-        if is_video_mode:
-            publisher.publish_video(
-                title=title, content=content, video_path=video_path
-            )
-        else:
-            publisher.publish(
-                title=title, content=content, image_paths=image_paths, post_time=post_time
-            )
-        _select_topics(publisher, topic_tags, timing_jitter=timing_jitter)
+    # --- Step 4: Fill form (skip if --skip-form-fill) ---
+    if not args.skip_form_fill:
+        print("[pipeline] Step 4: Filling form...")
+        try:
+            if is_video_mode:
+                publisher.publish_video(
+                    title=title, content=content, video_path=video_path
+                )
+            else:
+                publisher.publish(
+                    title=title, content=content, image_paths=image_paths, post_time=post_time
+                )
+            _select_topics(publisher, topic_tags, timing_jitter=timing_jitter)
+            print("FILL_STATUS: READY_TO_PUBLISH")
+        except CDPError as e:
+            print(f"Error during form fill: {e}", file=sys.stderr)
+            if downloader:
+                downloader.cleanup()
+            sys.exit(2)
+
+    # When --skip-form-fill is used, the form was prepared by an earlier step.
+    # Report READY_TO_PUBLISH so the caller (e.g., Step10) sees success.
+    if args.skip_form_fill:
         print("FILL_STATUS: READY_TO_PUBLISH")
-    except CDPError as e:
-        print(f"Error during form fill: {e}", file=sys.stderr)
-        if downloader:
-            downloader.cleanup()
-        sys.exit(2)
 
     # --- Step 5: Publish (optional) ---
     should_publish = not args.preview
@@ -911,6 +924,33 @@ def main():
                     ok=False,
                 )
                 sys.exit(4)
+
+            # ── Wait for product list AJAX to finish loading ──
+            # click_add_product confirms modal open, but product list may still
+            # be loading via XHR.  Poll until real product cards appear.
+            print("[pipeline] Waiting for product list to load...")
+            for wait_i in range(15):
+                dom_state = publisher._evaluate("""
+                    (function(){
+                        var sel=['.goods-item','.product-item','[class*="goods-item"]','[class*="product-item"]','li'];
+                        var cards=[];
+                        for(var i=0;i<sel.length;i++){var n=Array.from(document.querySelectorAll(sel[i])).filter(function(e){
+                            var r=e.getBoundingClientRect();return r.width>0&&r.height>0;
+                        });if(n.length){cards=n;break;}}
+                        var texts=cards.map(function(c){return(c.innerText||c.textContent||'').trim().slice(0,80);});
+                        var real=texts.filter(function(t){return t.length>5&&t.indexOf('加载')<0;});
+                        return{count:cards.length,real:real.length,loading:texts.some(function(t){return t.indexOf('加载')>=0;})};
+                    })()
+                """)
+                real_count = int((dom_state or {}).get("real", 0))
+                if real_count > 0:
+                    print(f"[pipeline] Product list ready ({real_count} items, {wait_i + 1}s)")
+                    break
+                if wait_i == 0 and (dom_state or {}).get("loading"):
+                    print("[pipeline] Product list AJAX still loading...")
+                time.sleep(1)
+            else:
+                print(f"[pipeline] Warning: product list not fully loaded after 15s, continuing anyway")
 
             if args.product_name or args.product_id:
                 select_result = publisher.select_product_with_match(
@@ -985,6 +1025,24 @@ def main():
 
     if args.preview:
         print("[pipeline] Preview mode is on, skipping publish click.")
+        # ── Verify publish button is present and visible (no click) ──
+        preview_btn = publisher._evaluate("""
+            (function() {
+                var btns = document.querySelectorAll('button');
+                for (var i = 0; i < btns.length; i++) {
+                    var text = (btns[i].textContent || '').trim();
+                    if (text.indexOf('发布') >= 0) {
+                        var r = btns[i].getBoundingClientRect();
+                        var style = window.getComputedStyle(btns[i]);
+                        if (r.width > 0 && r.height > 0 && style.display !== 'none' && style.visibility !== 'hidden')
+                            return 'visible';
+                        return 'hidden';
+                    }
+                }
+                return 'not_found';
+            })()
+        """)
+        print(f"[pipeline] Preview verification: publish button {preview_btn}")
 
     if should_publish:
         print("[pipeline] Step 5: Clicking publish button...")
@@ -1019,9 +1077,23 @@ def main():
 
 
 if __name__ == "__main__":
+    _pipeline_exit_code = 0
     try:
         with single_instance("post_to_xhs_publish"):
             main()
+    except SystemExit as e:
+        _pipeline_exit_code = int(e.code or 0)
     except SingleInstanceError as e:
         print(f"Error: {e}", file=sys.stderr)
-        sys.exit(3)
+        _pipeline_exit_code = 3
+    _pipeline_status = (
+        "success" if _pipeline_exit_code == 0 else
+        "manual_review" if _pipeline_exit_code == 4 else
+        "failed"
+    )
+    emit_step_result(StepResult(
+        step_name="step_c_publish",
+        status=_pipeline_status,
+        artifacts={"exit_code": _pipeline_exit_code},
+    ))
+    sys.exit(_pipeline_exit_code)

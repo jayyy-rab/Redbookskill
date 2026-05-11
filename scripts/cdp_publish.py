@@ -101,7 +101,7 @@ CDP_PORT = 9222
 XHS_CREATOR_URL = "https://creator.xiaohongshu.com/publish/publish?source=official"
 XHS_HOME_URL = "https://www.xiaohongshu.com"
 XHS_NOTIFICATION_URL = "https://www.xiaohongshu.com/notification"
-XHS_CREATOR_LOGIN_CHECK_URL = "https://creator.xiaohongshu.com"
+XHS_CREATOR_LOGIN_CHECK_URL = "https://creator.xiaohongshu.com/publish/publish?source=official"
 XHS_HOME_LOGIN_MODAL_KEYWORD = "登录后推荐更懂你的笔记"
 XHS_CONTENT_DATA_URL = "https://creator.xiaohongshu.com/statistics/data-analysis"
 XHS_CONTENT_DATA_API_PATH = "/api/galaxy/creator/datacenter/note/analyze/list"
@@ -1024,6 +1024,42 @@ class XiaohongshuPublisher:
             )
             return
         self._navigate(picset_url)
+
+    # ------------------------------------------------------------------
+    # Public navigation helper
+    # ------------------------------------------------------------------
+
+    def navigate(self, url: str) -> bool:
+        """Navigate to URL and wait for load.  Public wrapper around _navigate."""
+        try:
+            self._navigate(url)
+            return True
+        except Exception as exc:
+            print(f"[cdp_publish] navigate failed: {exc}")
+            return False
+
+    # ------------------------------------------------------------------
+    # Public screenshot helper
+    # ------------------------------------------------------------------
+
+    def capture_screenshot(self, output_path: str) -> bool:
+        """Capture full-viewport screenshot and save to PNG file."""
+        try:
+            result = self._send("Page.captureScreenshot", {"format": "png", "fromSurface": True})
+            img_b64 = result.get("data", "")
+            if not isinstance(img_b64, str) or not img_b64:
+                print("[cdp_publish] capture_screenshot: no data returned")
+                return False
+            import base64
+            img_data = base64.b64decode(img_b64)
+            os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+            with open(output_path, "wb") as f:
+                f.write(img_data)
+            print(f"[cdp_publish] Screenshot saved: {output_path}")
+            return True
+        except Exception as exc:
+            print(f"[cdp_publish] capture_screenshot failed: {exc}")
+            return False
 
     # ------------------------------------------------------------------
     # Login check
@@ -3977,11 +4013,8 @@ class XiaohongshuPublisher:
                 self._evaluate(f"""
                     (function() {{
                         var el = document.querySelector('{selector}');
-                        var nativeSetter = Object.getOwnPropertyDescriptor(
-                            window.HTMLInputElement.prototype, 'value'
-                        ).set;
                         el.focus();
-                        nativeSetter.call(el, {escaped_title});
+                        el.value = {escaped_title};
                         el.dispatchEvent(new Event('input', {{ bubbles: true }}));
                         el.dispatchEvent(new Event('change', {{ bubbles: true }}));
                         el.blur();
@@ -5142,6 +5175,14 @@ def main():
     # click-publish - just click the publish button on current page
     sub.add_parser("click-publish", help="Click publish button on already-filled page")
 
+    # screenshot - capture full-viewport screenshot
+    p_ss = sub.add_parser("screenshot", help="Capture full-viewport screenshot to PNG")
+    p_ss.add_argument("--output", required=True, help="Output PNG file path")
+
+    # navigate - navigate to URL
+    p_nav = sub.add_parser("navigate", help="Navigate to a URL")
+    p_nav.add_argument("--url", required=True, help="Target URL")
+
     p_list_feeds = sub.add_parser(
         "list-feeds",
         aliases=["list_feeds"],
@@ -5519,6 +5560,16 @@ def main():
             )
             publisher._click_publish()
             print("PUBLISH_STATUS: PUBLISHED")
+
+        elif args.command == "screenshot":
+            publisher.connect(reuse_existing_tab=reuse_existing_tab)
+            ok = publisher.capture_screenshot(args.output)
+            sys.exit(0 if ok else 1)
+
+        elif args.command == "navigate":
+            publisher.connect(reuse_existing_tab=reuse_existing_tab)
+            ok = publisher.navigate(args.url)
+            sys.exit(0 if ok else 1)
 
         elif args.command in ("list-feeds", "list_feeds"):
             publisher.connect(reuse_existing_tab=reuse_existing_tab)

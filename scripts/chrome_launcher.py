@@ -15,6 +15,8 @@ import sys
 import time
 import socket
 import subprocess
+import tempfile
+import json
 from typing import Optional
 
 CDP_PORT = 9222
@@ -27,22 +29,123 @@ _chrome_process: subprocess.Popen | None = None
 _current_account: Optional[str] = None
 
 
+def _runner_config_path() -> str:
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "config", "runner.json"))
+
+
+def _read_runner_config() -> dict:
+    try:
+        with open(_runner_config_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def get_default_account_and_port(
+    account: Optional[str] = None,
+    port: Optional[int] = None,
+) -> tuple[Optional[str], int]:
+    """Resolve the fixed runner account/port for local customer machines."""
+    runner = _read_runner_config()
+    resolved_account = account
+    if resolved_account is None:
+        configured_account = str(runner.get("runner_account") or "").strip()
+        if configured_account:
+            resolved_account = configured_account
+
+    if port is not None:
+        return resolved_account, int(port)
+
+    configured_port = runner.get("runner_port")
+    try:
+        if configured_port:
+            return resolved_account, int(configured_port)
+    except Exception:
+        pass
+
+    try:
+        from account_manager import get_account_port
+        return resolved_account, int(get_account_port(resolved_account, fallback=CDP_PORT))
+    except Exception:
+        return resolved_account, CDP_PORT
+
+
+def _port_marker_path(port: int) -> str:
+    return os.path.join(tempfile.gettempdir(), f"xhs_chrome_port_{int(port)}.json")
+
+
+def _read_port_marker(port: int) -> dict:
+    path = _port_marker_path(port)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_port_marker(port: int, account: Optional[str], profile_dir: str, pid: int | None) -> None:
+    path = _port_marker_path(port)
+    payload = {
+        "port": int(port),
+        "account": (account or "default"),
+        "profile_dir": profile_dir,
+        "pid": int(pid) if pid else None,
+        "updated_at": time.time(),
+    }
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def _clear_port_marker(port: int) -> None:
+    path = _port_marker_path(port)
+    try:
+        os.remove(path)
+    except Exception:
+        pass
+
+
 def get_chrome_path() -> str:
     """Find Chrome executable on Windows/macOS/Linux."""
+    # 0) explicit override by env
+    override = (os.environ.get("XHS_BROWSER_PATH") or os.environ.get("CHROME_PATH") or "").strip()
+    if override and os.path.isfile(override):
+        return override
+
+    # 1) optional local config override: config/browser.json -> {"browser_path":"..."}
+    try:
+        cfg_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "config", "browser.json"))
+        if os.path.isfile(cfg_path):
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            if isinstance(cfg, dict):
+                path = str(cfg.get("browser_path") or "").strip()
+                if path and os.path.isfile(path):
+                    return path
+    except Exception:
+        pass
+
     candidates = []
 
     if sys.platform == "win32":
         for env_var in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
             base = os.environ.get(env_var, "")
-            if base:
-                candidates.append(
-                    os.path.join(base, "Google", "Chrome", "Application", "chrome.exe")
-                )
+            if not base:
+                continue
+            candidates.append(os.path.join(base, "Google", "Chrome", "Application", "chrome.exe"))
+            candidates.append(os.path.join(base, "Microsoft", "Edge", "Application", "msedge.exe"))
+            candidates.append(os.path.join(base, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"))
     elif sys.platform == "darwin":
         candidates.extend(
             [
                 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
                 os.path.expanduser("~/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+                "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+                "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
             ]
         )
     else:
@@ -52,6 +155,8 @@ def get_chrome_path() -> str:
                 "/usr/bin/google-chrome-stable",
                 "/usr/bin/chromium-browser",
                 "/usr/bin/chromium",
+                "/usr/bin/microsoft-edge",
+                "/usr/bin/brave-browser",
             ]
         )
 
@@ -67,14 +172,17 @@ def get_chrome_path() -> str:
         or shutil.which("chromium")
         or shutil.which("chrome")
         or shutil.which("chrome.exe")
+        or shutil.which("msedge")
+        or shutil.which("msedge.exe")
+        or shutil.which("brave")
+        or shutil.which("brave.exe")
     )
     if found:
         return found
 
     raise FileNotFoundError(
-        "Chrome not found. Please install Google Chrome or set its path manually."
+        "Browser not found. Please install Chrome/Edge/Brave or set XHS_BROWSER_PATH."
     )
-
 
 def get_user_data_dir(account: Optional[str] = None) -> str:
     """
@@ -97,41 +205,6 @@ def get_user_data_dir(account: Optional[str] = None) -> str:
         return os.path.join(local_app_data, "Google", "Chrome", PROFILE_DIR_NAME)
 
 
-def get_account_runtime(account: Optional[str] = None) -> dict:
-    """
-    Resolve account runtime settings from account_manager.
-
-    Returns:
-        {
-          "profile_dir": str,
-          "proxy": str | "",
-          "port": int | None,
-          "group": str | ""
-        }
-    """
-    profile_dir = get_user_data_dir(account)
-    out = {
-        "profile_dir": profile_dir,
-        "proxy": "",
-        "port": None,
-        "group": "",
-    }
-    try:
-        from account_manager import get_account_info, get_default_account
-
-        name = account or get_default_account()
-        info = get_account_info(name)
-        if isinstance(info, dict):
-            out["profile_dir"] = info.get("profile_dir") or profile_dir
-            out["proxy"] = (info.get("proxy") or "").strip()
-            p = info.get("port")
-            out["port"] = int(p) if isinstance(p, int) and p > 0 else None
-            out["group"] = (info.get("group") or "").strip()
-    except Exception:
-        pass
-    return out
-
-
 def is_port_open(port: int, host: str = "127.0.0.1") -> bool:
     """Check if a TCP port is accepting connections."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -147,7 +220,6 @@ def launch_chrome(
     port: int = CDP_PORT,
     headless: bool = False,
     account: Optional[str] = None,
-    proxy_server: Optional[str] = None,
 ) -> subprocess.Popen | None:
     """
     Launch Chrome with remote debugging enabled.
@@ -167,9 +239,7 @@ def launch_chrome(
         return None
 
     chrome_path = get_chrome_path()
-    runtime = get_account_runtime(account)
-    user_data_dir = runtime["profile_dir"]
-    effective_proxy = (proxy_server or runtime.get("proxy") or "").strip()
+    user_data_dir = get_user_data_dir(account)
     _current_account = account
 
     cmd = [
@@ -182,8 +252,6 @@ def launch_chrome(
 
     if headless:
         cmd.append("--headless=new")
-    if effective_proxy:
-        cmd.append(f"--proxy-server={effective_proxy}")
 
     mode_label = "headless" if headless else "headed"
     account_label = account or "default"
@@ -191,20 +259,12 @@ def launch_chrome(
     print(f"  executable : {chrome_path}")
     print(f"  profile dir: {user_data_dir}")
     print(f"  debug port : {port}")
-    if effective_proxy:
-        print(f"  proxy      : {effective_proxy}")
 
-    popen_kw: dict = {
-        "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.DEVNULL,
-    }
-    if sys.platform == "win32":
-        # Detach so Chrome is not tied to the Python process lifetime (keep browser after script exits).
-        popen_kw["creationflags"] = (
-            subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-        )
-
-    proc = subprocess.Popen(cmd, **popen_kw)
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
     _chrome_process = proc
 
     # Wait for the debug port to become available
@@ -212,6 +272,7 @@ def launch_chrome(
     while time.time() < deadline:
         if is_port_open(port):
             print(f"[chrome_launcher] Chrome is ready on port {port}.")
+            _write_port_marker(port=port, account=account, profile_dir=user_data_dir, pid=proc.pid)
             return proc
         time.sleep(0.5)
 
@@ -268,6 +329,7 @@ def kill_chrome(port: int = CDP_PORT):
             except Exception:
                 pass
     _chrome_process = None
+    _clear_port_marker(port)
 
     # Strategy 3: Windows taskkill by port (fallback)
     if sys.platform == "win32" and is_port_open(port):
@@ -304,7 +366,6 @@ def restart_chrome(
     port: int = CDP_PORT,
     headless: bool = False,
     account: Optional[str] = None,
-    proxy_server: Optional[str] = None,
 ) -> subprocess.Popen | None:
     """
     Kill the current Chrome instance and relaunch with the specified mode.
@@ -324,14 +385,13 @@ def restart_chrome(
     print(f"[chrome_launcher] Restarting Chrome ({mode_label}, account: {account_label})...")
     kill_chrome(port)
     time.sleep(1)
-    return launch_chrome(port, headless=headless, account=account, proxy_server=proxy_server)
+    return launch_chrome(port, headless=headless, account=account)
 
 
 def ensure_chrome(
     port: int = CDP_PORT,
     headless: bool = False,
     account: Optional[str] = None,
-    proxy_server: Optional[str] = None,
 ) -> bool:
     """
     Ensure Chrome is running with remote debugging on the given port.
@@ -344,10 +404,30 @@ def ensure_chrome(
 
     Returns True if Chrome is available, False otherwise.
     """
+    requested_account = account or "default"
     if is_port_open(port):
-        return True
+        marker = _read_port_marker(port)
+        bound_account = str(marker.get("account") or "").strip()
+        if bound_account:
+            if bound_account == requested_account:
+                return True
+            print(
+                "[chrome_launcher] Port/account mismatch detected: "
+                f"port={port} bound={bound_account} requested={requested_account}. "
+                "Restarting Chrome with requested account profile..."
+            )
+            restart_chrome(port=port, headless=headless, account=account)
+            return is_port_open(port)
+
+        # Marker missing (Chrome may be started externally). Prefer deterministic account/profile.
+        print(
+            "[chrome_launcher] Port is open but account binding is unknown. "
+            f"Restarting Chrome on port {port} for account={requested_account} to ensure login persistence."
+        )
+        restart_chrome(port=port, headless=headless, account=account)
+        return is_port_open(port)
     try:
-        launch_chrome(port, headless=headless, account=account, proxy_server=proxy_server)
+        launch_chrome(port, headless=headless, account=account)
         return is_port_open(port)
     except FileNotFoundError as e:
         print(f"[chrome_launcher] Error: {e}", file=sys.stderr)
@@ -369,6 +449,15 @@ if __name__ == "__main__":
     parser.add_argument("--restart", action="store_true", help="Restart Chrome")
     parser.add_argument("--account", help="Account name to use (default: default account)")
     args = parser.parse_args()
+
+    port_explicit = "--port" in sys.argv
+    account_explicit = "--account" in sys.argv
+    resolved_account, resolved_port = get_default_account_and_port(
+        account=args.account if account_explicit else None,
+        port=args.port if port_explicit else None,
+    )
+    args.account = resolved_account
+    args.port = resolved_port
 
     if args.kill:
         kill_chrome(port=args.port)

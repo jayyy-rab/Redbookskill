@@ -471,3 +471,39 @@ def materialize_generated_photoshop_autotcc(
     if not out_paths:
         return downloaded_paths, meta
     return out_paths, meta
+
+
+def materialize_generated_auto_color(
+    generated_root: str | Path,
+    downloaded_paths: list[str],
+) -> tuple[list[str], dict[str, Any]]:
+    """Code-only auto color for generated images (no Photoshop dependency)."""
+    root = Path(generated_root).resolve()
+    pp = root / "postprocess_ps"
+    outd = pp / "after_code_autocolor"
+    outd.mkdir(parents=True, exist_ok=True)
+
+    from xhs_image_autofix import pillow_post_adjust, summarize_paths  # noqa: PLC0415
+
+    outputs: list[str] = []
+    for p in downloaded_paths:
+        src = Path(p)
+        if not src.is_file():
+            continue
+        out_path = outd / f"{src.stem}.jpg"
+        pillow_post_adjust(src, out_path)
+        if out_path.is_file():
+            outputs.append(str(out_path.resolve()))
+
+    meta: dict[str, Any] = {
+        "mode": "picset_generated_code_autocolor",
+        "generated_root": str(root),
+        "autocolor_ok": bool(outputs),
+        "outputs": outputs,
+        "inputs": [str(Path(p).resolve()) for p in downloaded_paths],
+        "engine": "pillow_post_adjust",
+    }
+    summarize_paths(pp / "generated_autocolor_log.json", meta)
+    if not outputs:
+        return downloaded_paths, meta
+    return outputs, meta

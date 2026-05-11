@@ -357,7 +357,7 @@ def main() -> None:
             "搜参考封面：优先更像电商实拍图的封面，弱化大字报/纯文字图（传给 xhs_images_to_picset，默认开）。"
         ),
     )
-    parser.add_argument("--picset-url", default="https://picsetai.cn/")
+    parser.add_argument("--picset-url", default="https://picsetai.com/zh-CN")
     parser.add_argument("--login-timeout", type=int, default=180)
     parser.add_argument("--publish-to-xhs", action="store_true")
     parser.add_argument("--preview", action="store_true")

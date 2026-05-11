@@ -12,21 +12,11 @@ import shutil
 import uuid
 from urllib.parse import urlparse, unquote
 
+import time
 import requests
 
 DEFAULT_TIMEOUT = 30  # seconds per download
 TEMP_DIR_PREFIX = "xhs_images_"
-
-# Xiaohongshu CDN hotlink checks: Referer must be the main site, not the CDN host.
-XHS_PAGE_REFERER = "https://www.xiaohongshu.com/"
-
-
-def _default_referer_for_url(url: str) -> str:
-    host = (urlparse(url).netloc or "").lower()
-    if "xhscdn.com" in host or "xhscdn" in host:
-        return XHS_PAGE_REFERER
-    parsed = urlparse(url)
-    return f"{parsed.scheme}://{parsed.netloc}/"
 
 
 class ImageDownloader:
@@ -98,28 +88,36 @@ class ImageDownloader:
 
         Raises requests.RequestException on network errors.
         """
-        # Build headers with Referer to bypass hotlink protection (XHS CDN requires main-site Referer).
+        # Build headers with Referer to bypass hotlink protection
+        parsed = urlparse(url)
         if referer is None:
-            referer = _default_referer_for_url(url)
+            referer = f"{parsed.scheme}://{parsed.netloc}/"
 
         headers = {
             "Referer": referer,
-            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         }
-        if referer == XHS_PAGE_REFERER:
-            headers["Origin"] = "https://www.xiaohongshu.com"
 
-        resp = requests.get(url, timeout=DEFAULT_TIMEOUT, stream=True, headers=headers)
-        resp.raise_for_status()
+        last_error: Exception | None = None
+        for attempt in range(1, 4):
+            try:
+                resp = requests.get(url, timeout=DEFAULT_TIMEOUT * 2, headers=headers)
+                resp.raise_for_status()
+                break
+            except Exception as exc:  # network / timeout / 4xx / 5xx
+                last_error = exc
+                if attempt >= 3:
+                    raise
+                time.sleep(1.5 * attempt)
+        if last_error is not None and "resp" not in locals():
+            raise last_error
 
         ext = self._guess_extension(url, resp.headers.get("Content-Type"))
         filename = f"{uuid.uuid4().hex[:12]}{ext}"
         filepath = os.path.join(self.temp_dir, filename)
 
         with open(filepath, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=8192):
-                f.write(chunk)
+            f.write(resp.content)
 
         self.downloaded_files.append(filepath)
         print(f"[image_downloader] Downloaded: {url}")
@@ -136,18 +134,16 @@ class ImageDownloader:
 
         Raises requests.RequestException on network errors.
         """
+        parsed = urlparse(url)
         if referer is None:
-            referer = _default_referer_for_url(url)
+            referer = f"{parsed.scheme}://{parsed.netloc}/"
 
         headers = {
             "Referer": referer,
-            "Accept": "*/*",
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         }
-        if referer == XHS_PAGE_REFERER:
-            headers["Origin"] = "https://www.xiaohongshu.com"
 
-        resp = requests.get(url, timeout=DEFAULT_TIMEOUT * 4, stream=True, headers=headers)
+        resp = requests.get(url, timeout=DEFAULT_TIMEOUT * 4, headers=headers)
         resp.raise_for_status()
 
         ext = self._guess_video_extension(url, resp.headers.get("Content-Type"))
@@ -155,8 +151,7 @@ class ImageDownloader:
         filepath = os.path.join(self.temp_dir, filename)
 
         with open(filepath, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=65536):
-                f.write(chunk)
+            f.write(resp.content)
 
         self.downloaded_files.append(filepath)
         size_mb = os.path.getsize(filepath) / (1024 * 1024)
@@ -164,7 +159,7 @@ class ImageDownloader:
         print(f"  -> {filepath} ({size_mb:.1f} MB)")
         return filepath
 
-    def download_all(self, urls: list[str]) -> list[str]:
+    def download_all(self, urls: list[str], referer: str | None = None) -> list[str]:
         """
         Download multiple images. Returns list of local file paths.
 
@@ -173,7 +168,7 @@ class ImageDownloader:
         paths = []
         for url in urls:
             try:
-                path = self.download(url)
+                path = self.download(url, referer=referer)
                 paths.append(path)
             except Exception as e:
                 print(f"[image_downloader] Failed to download {url}: {e}", file=sys.stderr)
