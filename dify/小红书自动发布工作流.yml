@@ -1,0 +1,254 @@
+# ============================================================
+# Dify 工作流：小红书自动发布（PRD v1.0）
+#
+# 架构边界：
+#   Dify 职责：收集输入 → 校验参数 → 调用 FastAPI → 展示结果
+#   Python 职责：Step 1-10 全部小红书自动化执行
+#
+# 链路：Dify → FastAPI (/api/v1/tasks) → Python Worker → Chrome/XHS
+# Dify 不得：直接调用单个脚本、控制浏览器、操作小红书页面
+#
+# 导入方式：Dify UI → 工作流 → 右上角「导入 DSL」
+# 导入后需配置：
+#   1. host.docker.internal 是否可达（如不可用改为宿主机 IP）
+#   2. 如后端 api_server.py 未运行，先启动：
+#      uvicorn api_server:app --host 127.0.0.1 --port 8765
+# ============================================================
+version: "0.6.0"
+kind: app
+app:
+  description: 小红书多账号自动发布 — 输入校验 → 创建后台任务 → 等待完成 → 展示结果
+  icon: "\U0001F4D5"
+  icon_background: '#FFEAD5'
+  mode: workflow
+  name: 小红书自动发布
+features:
+  opening_statement: ''
+  suggested_questions: []
+  speech_to_text:
+    enabled: false
+  text_to_speech:
+    enabled: false
+  retriever_resource:
+    enabled: false
+workflow:
+  conversation_variables: []
+  environment_variables: []
+  features:
+    file_upload:
+      image:
+        enabled: true
+  graph:
+    nodes:
+      # ============================================================
+      # 节点 1：开始节点 — 接收用户输入
+      # ============================================================
+      - data:
+          type: start
+          title: 接收参数
+          variables:
+            - variable: product_image
+              label: 产品图片路径
+              type: text-input
+              required: false
+              max_length: 1000
+              description: 产品图片本地路径或 Dify 文件 URL
+            - variable: seed_keyword
+              label: 搜索关键词
+              type: text-input
+              required: true
+              max_length: 100
+              description: 小红书搜索参考图用关键词
+            - variable: product_name
+              label: 商品名称
+              type: text-input
+              required: false
+              max_length: 200
+              description: 要挂载的商品名称（如不挂商品可留空）
+            - variable: brief
+              label: 文案要求
+              type: text-input
+              required: true
+              max_length: 2000
+              description: 商品卖点、风格要求、目标人群等
+            - variable: accounts
+              label: 发布账号
+              type: text-input
+              required: true
+              max_length: 200
+              description: 多个账号用逗号分隔，如 acc_a,acc_b
+            - variable: publish_mode
+              label: 发布模式
+              type: text-input
+              required: false
+              max_length: 10
+              description: "preview 或 live，默认 preview。allow_live_publish=false 时强制 preview"
+            - variable: allow_no_product
+              label: 允许不挂商品
+              type: text-input
+              required: false
+              max_length: 10
+              description: "true 或 false，默认 false。开启后允许不填商品名称"
+            - variable: allow_live_publish
+              label: 允许正式发布
+              type: text-input
+              required: false
+              max_length: 10
+              description: "true 或 false，默认 false。关闭时强制 preview 模式"
+        id: start
+        position:
+          x: 100
+          y: 100
+        type: start
+
+      # ============================================================
+      # 节点 2：Code 节点 — 参数校验 + 创建任务 + 轮询等待
+      #
+      # 内部按顺序完成：
+      #   1. 校验输入参数（必填项、格式、业务规则）
+      #   2. POST /api/v1/tasks 创建后台任务
+      #   3. 每 10 秒 GET 查询任务状态
+      #   4. 最多等待 10 分钟
+      #
+      # 错误场景全覆盖（中文提示）：
+      #   参数缺失 / product_name 校验 / publish_mode 校验 /
+      #   账号列表为空 / FastAPI 连接失败 / 任务超时
+      #
+      # 注意：如果 Dify sandbox 限制出站网络，需在 sandbox 配置中
+      # 放行 host.docker.internal:8765
+      # ============================================================
+      - data:
+          type: code
+          title: 参数校验与执行任务
+          variables:
+            - variable: product_image
+              value_selector:
+                - start
+                - product_image
+            - variable: seed_keyword
+              value_selector:
+                - start
+                - seed_keyword
+            - variable: product_name
+              value_selector:
+                - start
+                - product_name
+            - variable: brief
+              value_selector:
+                - start
+                - brief
+            - variable: accounts
+              value_selector:
+                - start
+                - accounts
+            - variable: publish_mode
+              value_selector:
+                - start
+                - publish_mode
+            - variable: allow_no_product
+              value_selector:
+                - start
+                - allow_no_product
+            - variable: allow_live_publish
+              value_selector:
+                - start
+                - allow_live_publish
+          code: "import json, time, urllib.request, urllib.parse, urllib.error\n\ndef main(\n    product_image,\n    seed_keyword: str,\n    product_name: str,\n    brief: str,\n    accounts: str,\n    publish_mode: str,\n    allow_no_product,\n    allow_live_publish,\n) -> dict:\n    if not seed_keyword or not seed_keyword.strip():\n        return _done(status=\"param_error\", error=\"【参数缺失】搜索关键词不能为空\")\n    if not brief or not brief.strip():\n        return _done(status=\"param_error\", error=\"【参数缺失】文案要求不能为空\")\n    if not accounts or not accounts.strip():\n        return _done(status=\"param_error\", error=\"【参数缺失】发布账号列表不能为空\")\n    mode = (publish_mode or \"preview\").strip().lower()\n    if mode not in (\"preview\", \"live\"):\n        return _done(status=\"param_error\", error=\"【参数无效】publish_mode 必须是 preview 或 live\")\n    alp = (str(allow_live_publish) if allow_live_publish is not None else \"false\").strip().lower() in (\"true\", \"1\", \"yes\")\n    if mode == \"live\" and not alp:\n        mode = \"preview\"\n    pn = (product_name or \"\").strip()\n    anp = (str(allow_no_product) if allow_no_product is not None else \"false\").strip().lower() in (\"true\", \"1\", \"yes\")\n    if not pn and not anp:\n        return _done(status=\"param_error\", error=\"【参数缺失】商品名称为空且不允许不挂商品，请填写商品名称或开启允许不挂商品\")\n    account_list = [a.strip() for a in accounts.split(\",\") if a.strip()]\n    if not account_list:\n        return _done(status=\"param_error\", error=\"【参数无效】账号列表为空，请检查 accounts 格式（逗号分隔）\")\n    pi = \"\"\n    if product_image is not None:\n        if isinstance(product_image, str):\n            pi = product_image.strip()\n        elif isinstance(product_image, dict):\n            for k in (\"url\", \"name\", \"related_id\"):\n                if k in product_image and product_image[k]:\n                    pi = str(product_image[k])\n                    break\n    task_id = f\"task_{int(time.time())}\"\n    payload = json.dumps({\"task_id\": task_id, \"client_id\": \"dify\", \"publish_mode\": mode, \"accounts\": account_list, \"tasks\": [{\"seed_keyword\": seed_keyword.strip(), \"brief\": brief.strip(), \"product_name\": pn, \"product_image\": pi}]}, ensure_ascii=False)\n    BASE_URL = \"http://host.docker.internal:8765/api/v1/tasks\"\n    try:\n        req = urllib.request.Request(BASE_URL, data=payload.encode(\"utf-8\"), method=\"POST\", headers={\"Content-Type\": \"application/json\"})\n        resp = urllib.request.urlopen(req, timeout=30)\n        body = json.loads(resp.read().decode(\"utf-8\"))\n    except urllib.error.URLError as e:\n        return _done(status=\"error\", error=\"【FastAPI 连接失败】无法连接到后端 http://host.docker.internal:8765。请确认 api_server.py 已启动，Dify 容器可达宿主机。错误: \" + str(e.reason))\n    except json.JSONDecodeError:\n        return _done(status=\"error\", error=\"【FastAPI 异常】后端返回非 JSON 响应\")\n    except Exception as e:\n        return _done(status=\"error\", error=\"【系统错误】\" + type(e).__name__ + \": \" + str(e))\n    if not body.get(\"ok\"):\n        return _done(status=\"error\", error=body.get(\"error\", \"【FastAPI 异常】后端返回失败状态\"))\n    task_id = body.get(\"task_id\", \"\")\n    if not task_id:\n        return _done(status=\"error\", error=\"【FastAPI 异常】响应缺少 task_id\")\n    MAX_WAIT, INTERVAL = 600, 10\n    waited = 0\n    while waited < MAX_WAIT:\n        try:\n            url = BASE_URL + \"/\" + urllib.parse.quote(task_id, safe=\"\")\n            req = urllib.request.Request(url, method=\"GET\")\n            resp = urllib.request.urlopen(req, timeout=15)\n            data = json.loads(resp.read().decode(\"utf-8\"))\n        except Exception:\n            time.sleep(INTERVAL)\n            waited += INTERVAL\n            continue\n        if not data.get(\"ok\"):\n            time.sleep(INTERVAL)\n            waited += INTERVAL\n            continue\n        result = data.get(\"result\") or data\n        s = (result.get(\"status\") or \"running\").lower()\n        if s in (\"completed\", \"failed\", \"cancelled\"):\n            return _done(status=s, error=\"\", task_id=task_id, total_accounts=result.get(\"total_accounts\", 0), success_count=result.get(\"success_count\", 0), failed_count=result.get(\"failed_count\", 0), manual_review_count=result.get(\"manual_review_count\", 0), result_detail=json.dumps(result, ensure_ascii=False, indent=2))\n        time.sleep(INTERVAL)\n        waited += INTERVAL\n    return _done(status=\"timeout\", error=\"【任务超时】任务执行超过 10 分钟仍未完成。任务 ID: \" + task_id)\n\ndef _done(status=\"\", error=\"\", task_id=\"\", total_accounts=0, success_count=0, failed_count=0, manual_review_count=0, result_detail=\"\"):\n    return {\"ok\": status not in (\"param_error\", \"error\", \"timeout\"), \"status\": status, \"error\": error, \"task_id\": task_id, \"total_accounts\": total_accounts, \"success_count\": success_count, \"failed_count\": failed_count, \"manual_review_count\": manual_review_count, \"result_detail\": result_detail}"
+          outputs:
+            ok:
+              type: boolean
+              children: null
+            status:
+              type: string
+              children: null
+            error:
+              type: string
+              children: null
+            task_id:
+              type: string
+              children: null
+            total_accounts:
+              type: number
+              children: null
+            success_count:
+              type: number
+              children: null
+            failed_count:
+              type: number
+              children: null
+            manual_review_count:
+              type: number
+              children: null
+            result_detail:
+              type: string
+              children: null
+          code_language: python
+        id: code_main
+        position:
+          x: 100
+          y: 300
+        type: code
+
+      # ============================================================
+      # 节点 3：结束节点 — 显示结果
+      # ============================================================
+      - data:
+          type: end
+          title: 执行结果
+          outputs:
+            - variable: status
+              value_selector:
+                - code_main
+                - status
+              value_type: string
+            - variable: error
+              value_selector:
+                - code_main
+                - error
+              value_type: string
+            - variable: task_id
+              value_selector:
+                - code_main
+                - task_id
+              value_type: string
+            - variable: total_accounts
+              value_selector:
+                - code_main
+                - total_accounts
+              value_type: number
+            - variable: success_count
+              value_selector:
+                - code_main
+                - success_count
+              value_type: number
+            - variable: failed_count
+              value_selector:
+                - code_main
+                - failed_count
+              value_type: number
+            - variable: manual_review_count
+              value_selector:
+                - code_main
+                - manual_review_count
+              value_type: number
+            - variable: result_detail
+              value_selector:
+                - code_main
+                - result_detail
+              value_type: string
+        id: end
+        position:
+          x: 100
+          y: 500
+        type: end
+
+    # ============================================================
+    # 连线
+    # ============================================================
+    edges:
+      - id: edge_start_code
+        source: start
+        target: code_main
+      - id: edge_code_end
+        source: code_main
+        target: end

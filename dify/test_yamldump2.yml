@@ -1,0 +1,59 @@
+version: 0.6.0
+kind: app
+app:
+  description: 测试 — 最小可用工作流
+  icon: 📕
+  icon_background: '#FFEAD5'
+  mode: workflow
+  name: 测试工作流
+features:
+  opening_statement: ''
+  suggested_questions: []
+  speech_to_text:
+    enabled: false
+  text_to_speech:
+    enabled: false
+  retriever_resource:
+    enabled: false
+workflow:
+  conversation_variables: []
+  environment_variables: []
+  features:
+    file_upload:
+      image:
+        enabled: false
+  graph:
+    nodes:
+    - data:
+        type: start
+        title: 接收参数
+        variables:
+        - variable: keyword
+          label: 关键词
+          type: text-input
+          required: true
+          max_length: 100
+          description: 测试用关键词
+      id: start
+      position:
+        x: 100
+        y: 100
+      type: start
+    - data:
+        type: end
+        title: 结束
+        outputs:
+        - variable: keyword
+          value_selector:
+          - start
+          - keyword
+          value_type: string
+      id: end
+      position:
+        x: 100
+        y: 300
+      type: end
+    edges:
+    - id: edge_start_end
+      source: start
+      target: end

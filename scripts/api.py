@@ -73,6 +73,7 @@ class RunRequest(BaseModel):
     image_paths: list[str] = []
     accounts: list[str] = ["runner"]
     mode: str = "preview"
+    allow_live_publish: bool = False
     brief: str = ""
 
 
@@ -128,6 +129,7 @@ def _run_skill(task_id: str, req: RunRequest) -> None:
             brief=req.brief,
             accounts=req.accounts,
             publish_mode=req.mode,
+            allow_live_publish=req.allow_live_publish,
         )
         result = run_task(ti, run_root=str(REPO_ROOT / "runs"))
         with _lock:

@@ -1,0 +1,20 @@
+---
+description: Stop all script execution immediately on user pause
+alwaysApply: true
+---
+
+# Pause Means Full Stop
+
+## Rule
+
+When the user indicates pause/stop/interrupt (e.g. "暂停", "先停", "停止", "中断"), treat it as a hard stop for the current automation chain.
+
+- Stop the current running command or workflow immediately.
+- Do not auto-retry, do not continue to next step, and do not start replacement commands.
+- Do not keep background jobs running for the same task.
+- Return a brief status of what has already completed and what was skipped.
+- Wait for explicit user confirmation before resuming any execution.
+
+## Applies To
+
+- Any script execution and multi-step automation flow in this workspace.
